@@ -6,7 +6,7 @@ test:
 itest: db-up
 	MEM_TEST_CH_ADDR=localhost:9000 go test -count=1 ./...
 db-up:
-	docker compose up -d clickhouse
+	docker compose up -d --wait clickhouse
 db-down:
 	docker compose down -v
 run:

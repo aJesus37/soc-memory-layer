@@ -8,5 +8,10 @@ services:
       CLICKHOUSE_DB: mem
     volumes:
       - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 volumes:
   chdata:
