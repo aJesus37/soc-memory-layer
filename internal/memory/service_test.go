@@ -55,6 +55,16 @@ func (f failingEmbedder) Embed(context.Context, string, []string) ([][]float32, 
 	return nil, f.err
 }
 
+// auditlessConn fails every Exec (the audit insert path) while letting all
+// other statements through to ClickHouse via the embedded interface.
+type auditlessConn struct {
+	driver.Conn
+}
+
+func (auditlessConn) Exec(context.Context, string, ...any) error {
+	return errors.New("injected audit failure")
+}
+
 func TestRecordObservation(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
@@ -260,6 +270,104 @@ func TestRecordObservationEmbedderDown(t *testing.T) {
 	}
 }
 
+func TestRecordObservationAuditBestEffort(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	s.conn = auditlessConn{conn}
+	scope := itestScope()
+
+	o, err := s.RecordObservation(ctx, Input{
+		Scope:     scope,
+		Kind:      "hunt_finding",
+		ActorType: "human",
+		ActorID:   "analyst-j",
+		Content:   "audit path down but 10.9.8.7 still recorded",
+	})
+	if err != nil {
+		t.Fatalf("audit failure must not fail the observation write, got error: %v", err)
+	}
+
+	obsID, err := uuid.Parse(o.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obsRows uint64
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.observations WHERE obs_id = ?", obsID,
+	).Scan(&obsRows); err != nil {
+		t.Fatal(err)
+	}
+	if obsRows != 1 {
+		t.Errorf("observation rows for %s = %d, want 1 (write is authoritative)", obsID, obsRows)
+	}
+	var auditRows uint64
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.audit WHERE target_id = ?", obsID,
+	).Scan(&auditRows); err != nil {
+		t.Fatal(err)
+	}
+	if auditRows != 0 {
+		t.Errorf("audit rows for %s = %d, want 0 (injected Exec failure)", obsID, auditRows)
+	}
+}
+
+func TestRecordObservationClientEventID(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+
+	id := strings.ToLower(uuid.NewString())
+	in := func() Input { // identical retry payload
+		return Input{
+			Scope:         scope,
+			Kind:          "agent_action",
+			ActorType:     "agent",
+			ActorID:       "sensor-7",
+			ClientEventID: id,
+			Content:       "retry me consistently against 172.16.0.1",
+		}
+	}
+	o1, err := s.RecordObservation(ctx, in())
+	if err != nil {
+		t.Fatal(err)
+	}
+	o2, err := s.RecordObservation(ctx, in())
+	if err != nil {
+		t.Fatalf("resubmitting the same ClientEventID must be accepted: %v", err)
+	}
+	if o1.ID != id || o2.ID != id {
+		t.Fatalf("obs IDs = %q, %q; both must equal ClientEventID %q", o1.ID, o2.ID, id)
+	}
+
+	// Storage does NOT dedup: two physical rows share the one obs_id.
+	gotID, _ := uuid.Parse(id)
+	var rows uint64
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.observations WHERE obs_id = ?", gotID,
+	).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Errorf("physical rows for repeated obs_id %s = %d, want 2 (no storage-level dedup)", id, rows)
+	}
+
+	// Equivalent UUID spellings collapse onto the canonical form.
+	canonical := uuid.NewString()
+	o3, err := s.RecordObservation(ctx, Input{
+		Scope: scope, Kind: "alert", ActorType: "agent", ActorID: "sensor-7",
+		ClientEventID: "{" + strings.ToUpper(canonical) + "}",
+		Content:       "braced uppercase spelling of the same key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o3.ID != canonical {
+		t.Errorf("braced/uppercase spelling stored as %q, want canonical %q", o3.ID, canonical)
+	}
+}
+
 func TestRecordObservationValidation(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
@@ -267,15 +375,16 @@ func TestRecordObservationValidation(t *testing.T) {
 
 	scope := itestScope()
 	bad := map[string]Input{
-		"empty content":    {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a"},
-		"blank content":    {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", Content: "   \t "},
-		"bad kind":         {Scope: scope, Kind: "gossip", ActorType: "human", ActorID: "a", Content: "x"},
-		"bad actor type":   {Scope: scope, Kind: "alert", ActorType: "robot", ActorID: "a", Content: "x"},
-		"empty scope":      {Kind: "alert", ActorType: "human", ActorID: "a", Content: "x"},
-		"blank scope":      {Scope: "  ", Kind: "alert", ActorType: "human", ActorID: "a", Content: "x"},
-		"empty actor id":   {Scope: scope, Kind: "alert", ActorType: "human", Content: "x"},
-		"bad conf":         {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", Confidentiality: "public", Content: "x"},
-		"malformed caseid": {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", CaseID: "not-a-uuid", Content: "x"},
+		"empty content":             {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a"},
+		"blank content":             {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", Content: "   \t "},
+		"bad kind":                  {Scope: scope, Kind: "gossip", ActorType: "human", ActorID: "a", Content: "x"},
+		"bad actor type":            {Scope: scope, Kind: "alert", ActorType: "robot", ActorID: "a", Content: "x"},
+		"empty scope":               {Kind: "alert", ActorType: "human", ActorID: "a", Content: "x"},
+		"blank scope":               {Scope: "  ", Kind: "alert", ActorType: "human", ActorID: "a", Content: "x"},
+		"empty actor id":            {Scope: scope, Kind: "alert", ActorType: "human", Content: "x"},
+		"bad conf":                  {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", Confidentiality: "public", Content: "x"},
+		"malformed caseid":          {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", CaseID: "not-a-uuid", Content: "x"},
+		"malformed client event id": {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", ClientEventID: "not-a-uuid", Content: "x"},
 	}
 	for name, in := range bad {
 		if _, err := s.RecordObservation(ctx, in); err == nil {
