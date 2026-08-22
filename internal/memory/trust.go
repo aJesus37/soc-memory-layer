@@ -39,17 +39,19 @@ type trustConfig struct {
 // ApplyTrust decides the initial status of a fact.
 //
 // Humans assert (always active). Agents propose unless the predicate is
-// whitelisted AND confidence >= floor — then it activates automatically.
-// Unknown actor types fail CLOSED (proposed), never open.
+// whitelisted AND confidence >= tc.floor — then it activates automatically.
+// Unknown actor types fail CLOSED (proposed), never open; a nil whitelist
+// fails closed too, since nothing can be whitelisted in it.
 //
-// Pure and log-free: env-derived configuration lives in loadTrustConfig,
-// so callers pass the whitelist explicitly.
-func ApplyTrust(actorType, predicate string, confidence float32, whitelist map[string]bool) Status {
+// Pure and log-free: env-derived configuration lives in loadTrustConfig;
+// callers thread the whole trustConfig through so the effective floor
+// cannot drift from what the operator configured.
+func ApplyTrust(actorType, predicate string, confidence float32, tc trustConfig) Status {
 	switch actorType {
 	case actorHuman:
 		return Active
 	case actorAgent:
-		if whitelist[predicate] && confidence >= defaultTrustFloor {
+		if tc.whitelist[predicate] && confidence >= tc.floor {
 			return Active
 		}
 	}
@@ -58,17 +60,19 @@ func ApplyTrust(actorType, predicate string, confidence float32, whitelist map[s
 
 // loadTrustConfig reads MEM_TRUST_FLOOR (float) and MEM_TRUST_WHITELIST
 // (comma-separated predicates). It is pure and log-free: an unset
-// MEM_TRUST_FLOOR, empty string, or unparseable value keeps the default
-// floor (0.8) with no error; MEM_TRUST_WHITELIST defaults to {resolved_to}
-// and any non-empty value replaces it wholesale (empty entries after
-// splitting are dropped, so an explicit list can disable auto-activation).
+// MEM_TRUST_FLOOR, empty string, unparseable value, NaN, or value outside
+// [0,1] keeps the default floor (0.8) with no error; MEM_TRUST_WHITELIST
+// defaults to {resolved_to} and any non-empty value replaces it wholesale
+// (empty entries after splitting are dropped, so an explicit list can
+// disable auto-activation).
 func loadTrustConfig() trustConfig {
 	cfg := trustConfig{
 		floor:     defaultTrustFloor,
 		whitelist: map[string]bool{defaultTrustWhitelist: true},
 	}
 	if v := strings.TrimSpace(os.Getenv("MEM_TRUST_FLOOR")); v != "" {
-		if f, err := strconv.ParseFloat(v, 32); err == nil {
+		// NaN fails both range comparisons, so it falls through to default.
+		if f, err := strconv.ParseFloat(v, 32); err == nil && f >= 0 && f <= 1 {
 			cfg.floor = float32(f)
 		}
 	}
