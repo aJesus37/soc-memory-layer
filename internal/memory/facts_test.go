@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -643,5 +644,337 @@ func TestAssertFactDoubleSupersede(t *testing.T) {
 	}
 	if len(open) != 1 || open[0] != "value-c" {
 		t.Errorf("open object values = %v, want exactly [value-c]", open)
+	}
+}
+
+// TestPromoteFact walks a forced agent proposal (non-whitelisted predicate,
+// high confidence) through human promotion. The promoted version must own
+// the FINAL validity-window read path with the promoter credited in
+// written_by, a sibling open fact sharing only (scope, subject, predicate)
+// must survive untouched, re-promotion and agent attempts must fail, and
+// the audit trail must stay content-free.
+func TestPromoteFact(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "promote.example.com")
+	subjUUID, err := uuid.Parse(subj.EntityID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sibling human assertion: stays open through the whole dance and
+	// proves the promote mutation closes ONE fact_id, not the business key.
+	f1, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "c2",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a proposal: agent + non-whitelisted predicate + high confidence
+	// can never auto-activate.
+	time.Sleep(1100 * time.Millisecond) // keep updated_at distinct per wave
+	prop, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "benign-parked",
+		Confidence:  0.99,
+		ActorType:   "agent",
+		ActorID:     "triage-bot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prop.Status != Proposed {
+		t.Fatalf("agent non-whitelisted fact = %s, want proposed", prop.Status)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	promoted, err := s.PromoteFact(ctx, prop.ID, "human", "analyst-k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.ID == prop.ID {
+		t.Error("transition reused the proposal's fact_id, want a fresh one")
+	}
+	if promoted.Status != Active || promoted.ObjectValue != "benign-parked" ||
+		promoted.Predicate != "verdict_malicious" || promoted.Confidence != 0.99 ||
+		promoted.WrittenBy != "analyst-k" {
+		t.Errorf("promoted fact wrong: %+v", promoted)
+	}
+	promotedUUID, _ := uuid.Parse(promoted.ID)
+	f1UUID, _ := uuid.Parse(f1.ID)
+
+	// Authoritative read path: exactly two open actives — the untouched
+	// sibling and the promoted proposal — each credited to its writer.
+	type openRow struct {
+		id uuid.UUID
+		by string
+	}
+	rows, err := conn.Query(ctx,
+		"SELECT fact_id, object_value, written_by FROM mem.facts FINAL "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? "+
+			"AND status = 'active' AND valid_to > now64(3)",
+		scope, subjUUID, "verdict_malicious",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	open := map[string]openRow{}
+	for rows.Next() {
+		var (
+			r openRow
+			v string
+		)
+		if err := rows.Scan(&r.id, &v, &r.by); err != nil {
+			t.Fatal(err)
+		}
+		open[v] = r
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 2 {
+		t.Fatalf("open facts after promote = %d (%v), want 2 (promoted + untouched sibling)", len(open), open)
+	}
+	if r := open["c2"]; r.id != f1UUID || r.by != "analyst-j" {
+		t.Errorf("sibling c2 row disturbed by promote: %+v", r)
+	}
+	if r := open["benign-parked"]; r.id != promotedUUID || r.by != "analyst-k" {
+		t.Errorf("promoted row wrong on FINAL read path: %+v", r)
+	}
+
+	// The proposal row is physically closed at or before the promotion.
+	propUUID, _ := uuid.Parse(prop.ID)
+	var vt time.Time
+	if err := conn.QueryRow(ctx,
+		"SELECT valid_to FROM mem.facts WHERE fact_id = ?", propUUID,
+	).Scan(&vt); err != nil {
+		t.Fatal(err)
+	}
+	if vt.Year() > 2100 || vt.After(promoted.ValidFrom) {
+		t.Errorf("proposal valid_to = %v, want closed at/before %v", vt, promoted.ValidFrom)
+	}
+
+	// Re-promotion fails both ways: the promoted id resolves to an active
+	// fact ("not proposed"), and the consumed proposal id no longer
+	// resolves at all — its version was replaced on FINAL.
+	if _, err := s.PromoteFact(ctx, promoted.ID, "human", "analyst-k"); err == nil ||
+		!strings.Contains(err.Error(), "not proposed") {
+		t.Errorf("promoting an active fact: err = %v, want a not-proposed error", err)
+	}
+	if _, err := s.PromoteFact(ctx, prop.ID, "human", "analyst-k"); err == nil {
+		t.Error("re-promoting a consumed proposal id must fail")
+	}
+
+	// Human gate fails closed for agents and junk/empty actor types.
+	for _, actor := range []string{"agent", "robot", ""} {
+		if _, err := s.PromoteFact(ctx, prop.ID, actor, "someone"); !errors.Is(err, ErrHumanGated) {
+			t.Errorf("promote as actor type %q: err = %v, want ErrHumanGated", actor, err)
+		}
+	}
+
+	// Unknown ids fail cleanly.
+	if _, err := s.PromoteFact(ctx, uuid.NewString(), "human", "analyst-k"); err == nil {
+		t.Error("promoting a nonexistent fact must fail")
+	}
+
+	// Audit: exactly one promote_fact row naming the row the transition
+	// wrote; summary carries statuses only, never object values.
+	op, actorType, table, summary := queryAudit(t, conn, ctx, promotedUUID)
+	if op != "promote_fact" || actorType != "human" || table != "facts" {
+		t.Errorf("audit shape wrong: op=%q actor=%q table=%q", op, actorType, table)
+	}
+	if !strings.Contains(summary, "from=proposed") || !strings.Contains(summary, "to=active") {
+		t.Errorf("payload_summary missing transition states: %q", summary)
+	}
+	for _, secret := range []string{"c2", "benign-parked"} {
+		if strings.Contains(summary, secret) {
+			t.Errorf("payload_summary leaks %q: %q", secret, summary)
+		}
+	}
+}
+
+// TestRetractFact covers human retraction of an active fact and of a
+// proposal. The retracted version must be born closed (invisible to
+// validity-window readers even without FINAL), the old version physically
+// closed, siblings untouched until retracted themselves, re-retraction and
+// agent attempts refused, and the audit row must carry exactly the
+// trimmed, 120-rune-capped reason.
+func TestRetractFact(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "retract.example.com")
+	subjUUID, err := uuid.Parse(subj.EntityID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "c2",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A proposal on the same predicate (different value, so its own sort
+	// key): retracting the active fact must leave it alone, and it must
+	// itself be retractable afterwards.
+	time.Sleep(1100 * time.Millisecond)
+	prop, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "maybe-bad",
+		Confidence:  0.99,
+		ActorType:   "agent",
+		ActorID:     "triage-bot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prop.Status != Proposed {
+		t.Fatalf("agent non-whitelisted fact = %s, want proposed", prop.Status)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	long := strings.Repeat("r", 125)
+	retracted, err := s.RetractFact(ctx, active.ID, "  "+long+"-BEYOND-CAP  ", "human", "analyst-k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retracted.Status != Retracted || retracted.WrittenBy != "analyst-k" ||
+		retracted.ObjectValue != "c2" || retracted.ID == active.ID {
+		t.Errorf("retracted fact wrong: %+v", retracted)
+	}
+
+	// The active side is gone from the authoritative read path; the
+	// sibling proposal remains open and proposed, untouched by the
+	// single-fact mutation.
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 0 {
+		t.Fatalf("open active facts after retract = %d, want 0", n)
+	}
+	var openProps uint64
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.facts FINAL "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? "+
+			"AND status = 'proposed' AND valid_to > now64(3)",
+		scope, subjUUID, "verdict_malicious",
+	).Scan(&openProps); err != nil {
+		t.Fatal(err)
+	}
+	if openProps != 1 {
+		t.Fatalf("open proposed facts after retracting the active one = %d, want 1", openProps)
+	}
+
+	// Born closed: the retracted row's valid_to sits at its own birth,
+	// never past valid_from+1s, so validity-window readers never see it.
+	retrUUID, _ := uuid.Parse(retracted.ID)
+	var (
+		st     string
+		vf, vt time.Time
+	)
+	if err := conn.QueryRow(ctx,
+		"SELECT status, valid_from, valid_to FROM mem.facts WHERE fact_id = ?", retrUUID,
+	).Scan(&st, &vf, &vt); err != nil {
+		t.Fatal(err)
+	}
+	if Status(st) != Retracted {
+		t.Errorf("stored status = %q, want retracted", st)
+	}
+	if vt.Year() > 2100 || vt.After(vf.Add(time.Second)) {
+		t.Errorf("retracted row valid_to = %v (valid_from %v), want born closed", vt, vf)
+	}
+
+	// The old active row is physically closed at or before the retraction.
+	activeUUID, _ := uuid.Parse(active.ID)
+	if err := conn.QueryRow(ctx,
+		"SELECT valid_to FROM mem.facts WHERE fact_id = ?", activeUUID,
+	).Scan(&vt); err != nil {
+		t.Fatal(err)
+	}
+	if vt.Year() > 2100 || vt.After(retracted.ValidFrom) {
+		t.Errorf("old row valid_to = %v, want closed at/before %v", vt, retracted.ValidFrom)
+	}
+
+	// Re-retraction fails both ways: the consumed active id no longer
+	// resolves on FINAL, and the retracted id resolves to a retracted row.
+	if _, err := s.RetractFact(ctx, active.ID, "again", "human", "analyst-k"); err == nil {
+		t.Error("re-retracting a consumed fact id must fail")
+	}
+	if _, err := s.RetractFact(ctx, retracted.ID, "again", "human", "analyst-k"); err == nil ||
+		!strings.Contains(err.Error(), "already retracted") {
+		t.Errorf("retracting a retracted fact: err = %v, want an already-retracted error", err)
+	}
+
+	// Human gate fails closed for agents and junk/empty actor types.
+	for _, actor := range []string{"agent", "robot", ""} {
+		if _, err := s.RetractFact(ctx, retracted.ID, "x", actor, "bot"); !errors.Is(err, ErrHumanGated) {
+			t.Errorf("retract as actor type %q: err = %v, want ErrHumanGated", actor, err)
+		}
+	}
+
+	// Unknown ids fail cleanly.
+	if _, err := s.RetractFact(ctx, uuid.NewString(), "x", "human", "analyst-k"); err == nil {
+		t.Error("retracting a nonexistent fact must fail")
+	}
+
+	// Audit: exactly one retract_fact row; the reason survives trimmed and
+	// hard-capped at 120 runes, with nothing beyond the cap stored.
+	op, actorType, table, summary := queryAudit(t, conn, ctx, retrUUID)
+	if op != "retract_fact" || actorType != "human" || table != "facts" {
+		t.Errorf("audit shape wrong: op=%q actor=%q table=%q", op, actorType, table)
+	}
+	if want := "from=active reason=" + long[:120]; summary != want {
+		t.Errorf("payload_summary = %q, want %q", summary, want)
+	}
+
+	// Retract the proposal too: empty reason contributes nothing, and the
+	// predicate ends with ZERO open facts of any status for any reader.
+	time.Sleep(1100 * time.Millisecond)
+	retrProp, err := s.RetractFact(ctx, prop.ID, "", "human", "analyst-k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retrProp.Status != Retracted {
+		t.Errorf("retracted proposal status = %s, want retracted", retrProp.Status)
+	}
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 0 {
+		t.Fatalf("open active facts after retracting everything = %d, want 0", n)
+	}
+	openProps = 0
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.facts FINAL "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? "+
+			"AND status = 'proposed' AND valid_to > now64(3)",
+		scope, subjUUID, "verdict_malicious",
+	).Scan(&openProps); err != nil {
+		t.Fatal(err)
+	}
+	if openProps != 0 {
+		t.Fatalf("open proposed facts after retracting everything = %d, want 0", openProps)
+	}
+	propRetrUUID, _ := uuid.Parse(retrProp.ID)
+	op, _, _, summary = queryAudit(t, conn, ctx, propRetrUUID)
+	if op != "retract_fact" || summary != "from=proposed" {
+		t.Errorf("proposal-retract audit: op=%q summary=%q, want from=proposed (empty reason omitted)", op, summary)
 	}
 }
