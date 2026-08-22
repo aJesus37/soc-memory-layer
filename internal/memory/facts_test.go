@@ -62,7 +62,7 @@ func mustResolveEntity(t *testing.T, conn driver.Conn, scope, raw string) entity
 // countOpenFacts counts open active facts for one (scope, subject,
 // predicate) through the authoritative read path: FINAL plus validity
 // window. This is what Enrich will query later.
-func countOpenFacts(t *testing.T, conn driver.Conn, ctx context.Context, scope string, subject uuid.UUID, predicate string) uint64 {
+func countOpenFacts(t *testing.T, ctx context.Context, conn driver.Conn, scope string, subject uuid.UUID, predicate string) uint64 {
 	t.Helper()
 	var n uint64
 	if err := conn.QueryRow(ctx,
@@ -127,7 +127,7 @@ func TestAssertFactSupersedes(t *testing.T) {
 
 	// The authoritative read path (validity-window query used later by
 	// Enrich): exactly ONE open fact for this (subject,predicate): f2's value.
-	if n := countOpenFacts(t, conn, ctx, scope, subjUUID, "verdict_malicious"); n != 1 {
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 1 {
 		t.Fatalf("want exactly 1 open fact, got %d", n)
 	}
 
@@ -258,7 +258,7 @@ func TestAssertFactAgentProposed(t *testing.T) {
 	}
 
 	// Prior fact still open; the proposal does not count as open-active.
-	if n := countOpenFacts(t, conn, ctx, scope, subjUUID, "verdict_malicious"); n != 1 {
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 1 {
 		t.Fatalf("prior human fact must remain the only open fact, got %d", n)
 	}
 	var vt time.Time
@@ -321,7 +321,6 @@ func TestAssertFactAgentAutoActivate(t *testing.T) {
 		Confidence:  0.95,
 		ActorType:   "agent",
 		ActorID:     "sensor-7",
-		OnBehalfOf:  "analyst-j",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -329,7 +328,7 @@ func TestAssertFactAgentAutoActivate(t *testing.T) {
 	if f2.Status != Active {
 		t.Fatalf("agent whitelisted fact above floor should be active, got %s", f2.Status)
 	}
-	if n := countOpenFacts(t, conn, ctx, scope, subjUUID, "resolved_to"); n != 1 {
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "resolved_to"); n != 1 {
 		t.Fatalf("want exactly 1 open fact after agent auto-activation, got %d", n)
 	}
 	var vt time.Time
@@ -528,7 +527,81 @@ func TestAssertFactClientEventID(t *testing.T) {
 	if distinctIDs != 1 || survivorID != want {
 		t.Errorf("surviving row fact_id = %s (distinct=%d), want ClientEventID %s", survivorID, distinctIDs, want)
 	}
-	if n := countOpenFacts(t, conn, ctx, scope, subjUUID, "retry_probe"); n != 1 {
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "retry_probe"); n != 1 {
 		t.Errorf("open facts after same-value re-assert = %d, want 1", n)
+	}
+}
+
+// TestAssertFactDoubleSupersede walks A→B→C on one (subject, predicate)
+// and requires exactly ONE open fact at every step, ending on C's value.
+// Each superseding wave closes whatever is currently open — so even if a
+// concurrent-assert race ever left two open facts behind, the next
+// supersede heals back to a single open fact (see AssertFact's concurrency
+// note).
+func TestAssertFactDoubleSupersede(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "chain.example.com")
+	subjUUID, err := uuid.Parse(subj.EntityID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	values := []string{"value-a", "value-b", "value-c"}
+	var last Fact
+	for i, v := range values {
+		if i > 0 {
+			// DateTime64(3) still ties at ms sometimes; keep 1.1s like
+			// other tests so each wave's validity window is distinct.
+			time.Sleep(1100 * time.Millisecond)
+		}
+		f, err := s.AssertFact(ctx, FactInput{
+			Scope:       scope,
+			SubjectID:   subj.EntityID,
+			Predicate:   "verdict_malicious",
+			ObjectValue: v,
+			Confidence:  0.9,
+			ActorType:   "human",
+			ActorID:     "analyst-j",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 1 {
+			t.Fatalf("after asserting %q: open facts = %d, want 1", v, n)
+		}
+		last = f
+	}
+
+	if last.ObjectValue != "value-c" || last.Status != Active {
+		t.Fatalf("final fact = %+v, want active with object value %q", last, "value-c")
+	}
+
+	// The authoritative read path agrees: only value-c survives as open.
+	rows, err := conn.Query(ctx,
+		"SELECT object_value FROM mem.facts FINAL "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? "+
+			"AND status = 'active' AND valid_to > now64(3)",
+		scope, subjUUID, "verdict_malicious",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var open []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		open = append(open, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0] != "value-c" {
+		t.Errorf("open object values = %v, want exactly [value-c]", open)
 	}
 }

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -27,26 +28,34 @@ import (
 // and eventually collapsed. Either way each active write supersedes open
 // priors first, so the authoritative FINAL read path stays correct.
 type FactInput struct {
-	Scope         string
-	SubjectID     string  // required, uuid
-	Predicate     string  // required non-empty
-	ObjectValue   string  // required non-empty
-	ObjectID      string  // optional uuid -> Nullable(UUID), "" = NULL
-	Confidence    float32 // clamped to [0,1]
-	SourceObs     string  // optional uuid -> zero uuid when empty
-	ActorType     string  // human|agent (validated)
-	ActorID       string  // required
-	OnBehalfOf    string  // optional
-	ClientEventID string  // optional idempotency hint, same rules as observations
+	Scope       string
+	SubjectID   string  // required, uuid
+	Predicate   string  // required non-empty
+	ObjectValue string  // required non-empty
+	ObjectID    string  // optional uuid -> Nullable(UUID), "" = NULL
+	Confidence  float32 // clamped to [0,1]
+	SourceObs   string  // optional uuid -> zero uuid when empty
+	ActorType   string  // human|agent (validated)
+	ActorID     string  // required
+	// OnBehalfOf is accepted but NOT persisted in Phase 1 (no facts
+	// column); delegation attribution lands with the API layer / schema
+	// evolution.
+	OnBehalfOf    string
+	ClientEventID string // optional idempotency hint, same rules as observations
 }
 
-// Fact is the persisted result of an AssertFact call.
+// Fact is the persisted result of an AssertFact call. SourceObs and
+// ObjectID echo what was stored (canonical UUID form), with "" standing in
+// for the stored sentinels: unknown provenance (zero-UUID source_obs) and
+// NULL object_id respectively.
 type Fact struct {
 	ID          string
 	Scope       string
 	SubjectID   string
 	Predicate   string
 	ObjectValue string
+	ObjectID    string
+	SourceObs   string
 	Status      Status
 	Confidence  float32
 	ValidFrom   time.Time
@@ -75,6 +84,20 @@ var farFuture = time.Date(2105, 12, 31, 23, 59, 59, 0, time.UTC)
 // The status column is ALWAYS written explicitly: its schema default is
 // 'active' (fail-open) and must never be relied upon.
 //
+// Concurrency: the close-then-insert sequence is not atomic across
+// processes. Two concurrent AssertFact calls on the same
+// (scope, subject, predicate) can interleave as close/close(0 rows)/
+// insert/insert, leaving TWO open facts with different object_value —
+// FINAL never collapses distinct sort keys, so both stay open. This is
+// self-healing: whichever write supersedes next closes every currently
+// open fact for the key in one wave. Phase 1 accepts this window;
+// a future remedy is per-key serialization or compare-and-retry.
+//
+// Failure window: closure via mutation is wall-clock and unrecoverable —
+// if the insert after a successful supersede fails, the prior facts stay
+// closed and no replacement exists. Accepted for Phase 1; the call logs
+// the lost window and returns the error.
+//
 // Audit is best-effort like RecordObservation's: one content-free summary
 // row per write (operation='assert_fact'), noting how many prior facts the
 // mutation closed (superseded=N); failures are logged and swallowed.
@@ -98,6 +121,17 @@ func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 
 	validFrom := time.Now().UTC()
 	if err := s.insertFact(ctx, fact, status, conf, validFrom); err != nil {
+		if superseded > 0 {
+			// The supersede wave already committed: the priors are closed
+			// for good and no replacement row exists. Log the lost window
+			// (content-safe fields only), then surface the insert error.
+			s.log.Warn("memory: fact supersede without insert",
+				"scope", fact.scope,
+				"subject", fact.subjectUUID,
+				"predicate", fact.predicate,
+				"superseded", superseded,
+				"err", err)
+		}
 		return Fact{}, err
 	}
 
@@ -116,12 +150,23 @@ func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 			"err", err)
 	}
 
+	objIDStr := ""
+	if fact.objectID != nil {
+		objIDStr = fact.objectID.String()
+	}
+	srcObsStr := ""
+	if fact.sourceObs != uuid.Nil {
+		srcObsStr = fact.sourceObs.String()
+	}
+
 	return Fact{
 		ID:          fact.factUUID.String(),
 		Scope:       fact.scope,
 		SubjectID:   fact.subjectUUID.String(),
 		Predicate:   fact.predicate,
 		ObjectValue: fact.objectValue,
+		ObjectID:    objIDStr,
+		SourceObs:   srcObsStr,
 		Status:      status,
 		Confidence:  conf,
 		ValidFrom:   validFrom,
@@ -214,7 +259,7 @@ func (s *Service) validateFact(in FactInput) (factArgs, error) {
 // to 1 would let it auto-activate a whitelisted fact via conf >= floor.
 func clampConfidence(c float32) float32 {
 	switch {
-	case c != c: // NaN
+	case math.IsNaN(float64(c)): // NaN
 		return 0
 	case c < 0:
 		return 0
@@ -226,11 +271,19 @@ func clampConfidence(c float32) float32 {
 }
 
 // closeOpenFacts sets valid_to = now on every currently-open active fact
-// for one (scope, subject, predicate) and returns how many were open
-// (pre-count; single-process Phase 1 makes the race immaterial for a
-// best-effort audit number). mutations_sync = 1 makes the ALTER wait for
-// completion so a subsequent insert can never be re-closed by its own
-// supersede wave — at Phase-1 volumes this synchronous wait is fine.
+// for one (scope, subject, predicate) and returns how many were open.
+//
+// The count and the mutation are two statements, so under concurrency n is
+// a pre-count snapshot: rows inserted between the two land inside the
+// mutation's WHERE clause too, meaning superseded=N can UNDERCOUNT what
+// was actually closed (never overcount). Callers must treat N as
+// best-effort, not exact.
+//
+// mutations_sync = 1 makes the ALTER wait for completion so a subsequent
+// insert can never be re-closed by its own supersede wave — at Phase-1
+// volumes this synchronous wait is fine. Operators should watch the
+// system.mutations backlog (pending/failed mutation entries) for lag or
+// stuck waves on mem.facts.
 func (s *Service) closeOpenFacts(ctx context.Context, scope string, subject uuid.UUID, predicate string) (uint64, error) {
 	var n uint64
 	if err := s.conn.QueryRow(ctx,
