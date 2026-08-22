@@ -1,6 +1,9 @@
 package entity
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalize(t *testing.T) {
 	cases := []struct {
@@ -25,6 +28,12 @@ func TestNormalize(t *testing.T) {
 		{"T99999", "", "", false},
 		{"hello world", "", "", false},
 		{"", "", "", false},
+		// sha512 length accepted
+		{strings.Repeat("a", 128), IocHash, strings.Repeat("a", 128), true},
+		// real-world contaminants must stay rejected (dedup keys depend on it)
+		{"http://example.com", "", "", false},
+		{"example.com:8080", "", "", false},
+		{"fe80::1%eth0", "", "", false},
 	}
 	for _, c := range cases {
 		got, err := Normalize(c.in)
