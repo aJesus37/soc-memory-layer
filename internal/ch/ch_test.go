@@ -3,6 +3,7 @@ package ch
 import (
 	"context"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,43 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 	if n != uint64(len(names)) {
 		t.Errorf("recorded migrations = %d, want %d (one per embedded .sql file)", n, len(names))
+	}
+}
+
+func TestSchemaTables(t *testing.T) {
+	ctx := context.Background()
+	conn := testConn(t)
+	if err := Migrate(ctx, conn, config.Load()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := conn.Query(ctx, "SHOW TABLES FROM mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"entities",
+		"observations",
+		"facts",
+		"edges",
+		"audit",
+		"schema_migrations",
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("SHOW TABLES FROM mem = %v, want %v", got, want)
 	}
 }
 
