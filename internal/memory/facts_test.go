@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,40 @@ import (
 
 	"socmem/internal/entity"
 )
+
+// TestClampConfidence pins the [0,1] saturation rules, including the
+// fail-safe NaN mapping: NaN compares false against everything, so it must
+// be matched explicitly and become 0 — clamping it to 1 would let a
+// NaN-confidence agent fact auto-activate via conf >= floor.
+func TestClampConfidence(t *testing.T) {
+	cases := []struct {
+		name string
+		in   float32
+		want float32
+	}{
+		{"in range unchanged", 0.42, 0.42},
+		{"zero", 0, 0},
+		{"one", 1, 1},
+		{"negative saturates low", -0.5, 0},
+		{"above range saturates high", 1.7, 1},
+		{"NaN fails safe to zero", float32(math.NaN()), 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := clampConfidence(c.in); got != c.want {
+				t.Errorf("clampConfidence(%v) = %v, want %v", c.in, got, c.want)
+			}
+		})
+	}
+
+	t.Run("NaN confidence cannot cross the auto-activation floor", func(t *testing.T) {
+		tc := trustConfig{floor: 0.8, whitelist: map[string]bool{"resolved_to": true}}
+		got := ApplyTrust(actorAgent, "resolved_to", clampConfidence(float32(math.NaN())), tc)
+		if got != Proposed {
+			t.Errorf("NaN-confidence agent fact status = %v, want proposed (fail safe)", got)
+		}
+	})
+}
 
 // mustResolveEntity resolves raw to its canonical entity via the real
 // resolver, creating it on first sight; tests use the EntityID as a fact
@@ -358,8 +393,16 @@ func TestAssertFactValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if low.Confidence != 0 || high.Confidence != 1 {
-		t.Errorf("confidence clamp wrong: low=%v high=%v, want 0 and 1", low.Confidence, high.Confidence)
+	nan, err := s.AssertFact(ctx, FactInput{
+		Scope: scope, SubjectID: clamped.EntityID, Predicate: "score_nan",
+		ObjectValue: "z", Confidence: float32(math.NaN()), ActorType: "human", ActorID: "a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if low.Confidence != 0 || high.Confidence != 1 || nan.Confidence != 0 {
+		t.Errorf("confidence clamp wrong: low=%v high=%v nan=%v, want 0, 1, 0",
+			low.Confidence, high.Confidence, nan.Confidence)
 	}
 
 	// Unknown source_obs is allowed: empty string stores the zero UUID
@@ -446,6 +489,10 @@ func TestAssertFactClientEventID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// DateTime64(3) still ties at ms sometimes; keep 1.1s like other tests
+	// so FINAL's newest-version selection between the two retries (same
+	// sort key) stays deterministic.
+	time.Sleep(1100 * time.Millisecond)
 	f2, err := s.AssertFact(ctx, in())
 	if err != nil {
 		t.Fatalf("resubmitting the same ClientEventID must be accepted: %v", err)
@@ -455,18 +502,31 @@ func TestAssertFactClientEventID(t *testing.T) {
 		t.Fatalf("fact IDs = %q, %q; both must equal ClientEventID canonical form", f1.ID, f2.ID)
 	}
 
-	// Storage does NOT dedup: two physical rows share the one fact_id;
-	// the authoritative read path still sees exactly ONE open fact because
-	// each write supersedes the prior before inserting.
+	// Storage does NOT dedup by fact_id — but it also does NOT guarantee
+	// that two physical rows survive: both retries share the full
+	// ReplacingMergeTree sort key (scope, subject_id, predicate,
+	// object_value), differing only in updated_at, so a background merge
+	// may legally collapse them into one row (the newest updated_at wins)
+	// at any moment before this count runs. Accept 1 or 2; the invariant
+	// that matters lives on the FINAL read path below.
 	subjUUID, _ := uuid.Parse(subj.EntityID)
-	var rows uint64
+	var (
+		physicalRows uint64
+		distinctIDs  uint64
+		survivorID   uuid.UUID
+	)
 	if err := conn.QueryRow(ctx,
-		"SELECT count() FROM mem.facts WHERE fact_id = ?", want,
-	).Scan(&rows); err != nil {
+		"SELECT count(), uniqExact(fact_id), max(fact_id) FROM mem.facts "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? AND object_value = ?",
+		scope, subjUUID, "retry_probe", "same-value",
+	).Scan(&physicalRows, &distinctIDs, &survivorID); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 2 {
-		t.Errorf("physical rows for repeated fact_id %s = %d, want 2 (no storage-level dedup)", id, rows)
+	if physicalRows < 1 || physicalRows > 2 {
+		t.Errorf("physical rows for repeated fact_id %s = %d, want 1 or 2 (ReplacingMergeTree merge makes 2 non-guaranteed)", id, physicalRows)
+	}
+	if distinctIDs != 1 || survivorID != want {
+		t.Errorf("surviving row fact_id = %s (distinct=%d), want ClientEventID %s", survivorID, distinctIDs, want)
 	}
 	if n := countOpenFacts(t, conn, ctx, scope, subjUUID, "retry_probe"); n != 1 {
 		t.Errorf("open facts after same-value re-assert = %d, want 1", n)

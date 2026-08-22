@@ -18,9 +18,14 @@ import (
 //
 // ClientEventID follows the same rules as Input.ClientEventID: it becomes
 // the row's fact_id when set (canonical UUID form). There is NO
-// storage-level dedup on fact_id — a retry inserts a second physical row;
-// acceptable because each active write supersedes priors first, so the
-// authoritative read path stays correct.
+// storage-level dedup on fact_id — a retry is accepted, never rejected as
+// a duplicate. Whether it leaves a second physical row depends on the
+// value asserted: a same-value retry shares the full ReplacingMergeTree
+// sort key (scope, subject_id, predicate, object_value) and may therefore
+// be merged away entirely by a background merge, while a different-value
+// retry forms a new key and stays physically distinct until superseded
+// and eventually collapsed. Either way each active write supersedes open
+// priors first, so the authoritative FINAL read path stays correct.
 type FactInput struct {
 	Scope         string
 	SubjectID     string  // required, uuid
@@ -203,13 +208,17 @@ func (s *Service) validateFact(in FactInput) (factArgs, error) {
 	}, nil
 }
 
-// clampConfidence clamps into [0,1]; NaN fails both comparisons and maps
-// to 0 (no confidence).
+// clampConfidence clamps into [0,1], saturating at the nearer bound. NaN
+// compares false against everything, so it is matched explicitly and maps
+// to 0: an unknown score must fail safe as LOW confidence — clamping NaN
+// to 1 would let it auto-activate a whitelisted fact via conf >= floor.
 func clampConfidence(c float32) float32 {
 	switch {
+	case c != c: // NaN
+		return 0
 	case c < 0:
 		return 0
-	case c > 1 || c != c: // c > 1 also catches NaN falling through both range checks
+	case c > 1:
 		return 1
 	default:
 		return c
