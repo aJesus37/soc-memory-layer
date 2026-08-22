@@ -35,6 +35,15 @@ func NewResolver(conn driver.Conn) *Resolver {
 // Resolve normalizes raw, then returns the canonical entity for
 // (scope, type, key). Creates it on first sight.
 //
+// Concurrency note: concurrent first-sight creates are last-write-wins
+// under ReplacingMergeTree; racing callers may each observe a different
+// pre-collapse entity_id for the same key. Phase 1 mitigation is that the
+// service is single-process; cross-process reconcile tooling is future
+// work.
+//
+// A "hit" is not a pure read: it performs a write (a last_seen refresh
+// upsert).
+//
 // Lookups use FINAL: the table is small at current scale and dedup
 // correctness matters more than read throughput; the alternative
 // (ORDER BY updated_at DESC LIMIT 1) can be revisited if it ever grows.
