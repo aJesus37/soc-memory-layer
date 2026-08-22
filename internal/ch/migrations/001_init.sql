@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS mem.entities (
   attrs        Map(String, String),
   first_seen   DateTime,
   last_seen    DateTime,
-  updated_at   DateTime DEFAULT now()
+  updated_at   DateTime64(3) DEFAULT now64(3)
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (scope, entity_type, key);
 
@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS mem.observations (
   content         String,
   content_vec     Array(Float32),
   entity_refs     Array(UUID),
-  INDEX ft_idx content TYPE text(tokenizer = splitByNonAlpha)
+  INDEX ft_idx content TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 10000,
+  INDEX bf_entity_refs entity_refs TYPE bloom_filter(0.01) GRANULARITY 2,
+  INDEX mm_case case_id TYPE minmax GRANULARITY 4
 ) ENGINE = MergeTree
 ORDER BY (scope, ts)
 TTL ts + INTERVAL 365 DAY DELETE WHERE kind = 'alert';
@@ -48,8 +50,8 @@ CREATE TABLE IF NOT EXISTS mem.facts (
   source_obs   UUID,
   written_by   String DEFAULT '',
   valid_from   DateTime,
-  valid_to     DateTime DEFAULT toDateTime64('9999-12-31 00:00:00', 0),
-  updated_at   DateTime DEFAULT now()
+  valid_to     DateTime DEFAULT toDateTime('2105-12-31 23:59:59'),
+  updated_at   DateTime64(3) DEFAULT now64(3)
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (scope, subject_id, predicate, object_value);
 
@@ -61,7 +63,8 @@ CREATE TABLE IF NOT EXISTS mem.edges (
   relation   LowCardinality(String),
   from_fact  UUID,
   valid_from DateTime,
-  valid_to   DateTime DEFAULT toDateTime64('9999-12-31 00:00:00', 0)
+  valid_to   DateTime DEFAULT toDateTime('2105-12-31 23:59:59'),
+  INDEX bf_dst dst_id TYPE bloom_filter(0.01) GRANULARITY 2
 ) ENGINE = MergeTree
 ORDER BY src_id;
 

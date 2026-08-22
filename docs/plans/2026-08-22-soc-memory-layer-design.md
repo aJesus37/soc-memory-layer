@@ -69,7 +69,7 @@ CREATE TABLE mem.entities (
   attrs       Map(String, String),
   first_seen  DateTime,
   last_seen   DateTime,
-  updated_at  DateTime DEFAULT now()
+  updated_at  DateTime64(3) DEFAULT now64(3)
 ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY (scope, entity_type, key);
 
 -- append-only episodic layer
@@ -104,8 +104,8 @@ CREATE TABLE mem.facts (
   source_obs  UUID,
   written_by  String,                 -- actor attribution
   valid_from  DateTime,
-  valid_to    DateTime DEFAULT toDateTime64('9999-12-31', 0),
-  updated_at  DateTime DEFAULT now()
+  valid_to    DateTime DEFAULT toDateTime('2105-12-31 23:59:59'),
+  updated_at  DateTime64(3) DEFAULT now64(3)
 ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY (scope, subject_id, predicate, object_value);
 
 -- edge source-of-truth rows (graph projection replays from here)
