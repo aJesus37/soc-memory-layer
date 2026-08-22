@@ -88,6 +88,7 @@ CREATE TABLE mem.observations (
   content_vec Array(Float32),        -- empty array if embedding unavailable
   entity_refs Array(UUID)
 ) ENGINE = MergeTree ORDER BY (scope, ts);   -- TTL per scope policy
+-- indexes: bf_entity_refs bloom, mm_case minmax (+ ft_idx text)
 
 -- distilled semantic layer, version-at-read
 CREATE TABLE mem.facts (
@@ -117,8 +118,9 @@ CREATE TABLE mem.edges (
   relation   LowCardinality(String),
   from_fact  UUID,
   valid_from DateTime,
-  valid_to   DateTime
+  valid_to   DateTime DEFAULT toDateTime('2105-12-31 23:59:59')
 ) ENGINE = MergeTree ORDER BY src_id;
+-- indexes: bf_dst bloom
 
 -- every write, attributed; NO TTL ever (evidence-adjacent)
 CREATE TABLE mem.audit (

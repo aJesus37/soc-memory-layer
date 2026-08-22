@@ -36,8 +36,7 @@ func Connect(ctx context.Context, addr, user, pass string, database string) (dri
 		},
 		DialTimeout: 10 * time.Second,
 		Settings: map[string]any{
-			"max_execution_time":          60,
-			"date_time_overflow_behavior": "throw",
+			"max_execution_time": 60,
 		},
 	})
 	if err != nil {
