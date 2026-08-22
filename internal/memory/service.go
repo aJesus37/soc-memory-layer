@@ -77,16 +77,20 @@ type Service struct {
 	resolver *entity.Resolver
 	embedder embed.Embedder
 	cfg      config.Config
+	trust    trustConfig
 	log      *slog.Logger
 }
 
-// New builds a Service over an open ClickHouse connection.
+// New builds a Service over an open ClickHouse connection. The trust
+// policy (floor + auto-activation whitelist) is read from MEM_TRUST_*
+// env vars here; a later task threads it through config.Load() properly.
 func New(conn driver.Conn, r *entity.Resolver, e embed.Embedder, cfg config.Config) *Service {
 	return &Service{
 		conn:     conn,
 		resolver: r,
 		embedder: e,
 		cfg:      cfg,
+		trust:    loadTrustConfig(),
 		log:      slog.Default(),
 	}
 }
