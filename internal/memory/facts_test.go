@@ -532,12 +532,14 @@ func TestAssertFactClientEventID(t *testing.T) {
 	}
 }
 
-// TestAssertFactDoubleSupersede walks A→B→C on one (subject, predicate)
-// and requires exactly ONE open fact at every step, ending on C's value.
-// Each superseding wave closes whatever is currently open — so even if a
-// concurrent-assert race ever left two open facts behind, the next
-// supersede heals back to a single open fact (see AssertFact's concurrency
-// note).
+// TestAssertFactDoubleSupersede walks A→B on one (subject, predicate),
+// then plants a second OPEN fact for the same key via direct insert —
+// simulating the concurrent-assert race documented on AssertFact, which
+// can leave two open facts with different object_value. The final C wave
+// must close BOTH open priors in a single supersede and leave exactly
+// ['value-c'] open on the FINAL read path. A broken closeOpenFacts capped
+// at one row per wave would pass the plain A→B→C chain but fails here:
+// 'value-race' would survive open.
 func TestAssertFactDoubleSupersede(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
@@ -549,15 +551,14 @@ func TestAssertFactDoubleSupersede(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	values := []string{"value-a", "value-b", "value-c"}
-	var last Fact
+	values := []string{"value-a", "value-b"}
 	for i, v := range values {
 		if i > 0 {
 			// DateTime64(3) still ties at ms sometimes; keep 1.1s like
 			// other tests so each wave's validity window is distinct.
 			time.Sleep(1100 * time.Millisecond)
 		}
-		f, err := s.AssertFact(ctx, FactInput{
+		if _, err := s.AssertFact(ctx, FactInput{
 			Scope:       scope,
 			SubjectID:   subj.EntityID,
 			Predicate:   "verdict_malicious",
@@ -565,16 +566,55 @@ func TestAssertFactDoubleSupersede(t *testing.T) {
 			Confidence:  0.9,
 			ActorType:   "human",
 			ActorID:     "analyst-j",
-		})
-		if err != nil {
+		}); err != nil {
 			t.Fatal(err)
 		}
 		if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 1 {
 			t.Fatalf("after asserting %q: open facts = %d, want 1", v, n)
 		}
-		last = f
 	}
 
+	// Plant the race's leftover directly (bypasses AssertFact): an extra
+	// OPEN row for the same key, different object_value, sentinel valid_to.
+	time.Sleep(1100 * time.Millisecond) // keep updated_at distinct from the B wave
+	batch, err := conn.PrepareBatch(ctx,
+		"INSERT INTO mem.facts "+
+			"(fact_id, scope, subject_id, predicate, object_value, object_id, "+
+			"status, confidence, source_obs, written_by, valid_from, valid_to, updated_at)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plantedAt := time.Now().UTC()
+	if err := batch.Append(
+		uuid.New(), scope, subjUUID, "verdict_malicious", "value-race", nil,
+		string(Active), float32(0.9), uuid.Nil, "analyst-j",
+		plantedAt, farFuture, plantedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Send(); err != nil {
+		t.Fatal(err)
+	}
+	// The plant really produced a dual-open state; otherwise the final
+	// assertion would silently degrade to the single-prior case.
+	if n := countOpenFacts(t, ctx, conn, scope, subjUUID, "verdict_malicious"); n != 2 {
+		t.Fatalf("after planting value-race: open facts = %d, want 2", n)
+	}
+
+	// One healing wave through AssertFact must close BOTH priors.
+	time.Sleep(1100 * time.Millisecond)
+	last, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "value-c",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if last.ObjectValue != "value-c" || last.Status != Active {
 		t.Fatalf("final fact = %+v, want active with object value %q", last, "value-c")
 	}

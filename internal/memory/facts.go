@@ -273,11 +273,12 @@ func clampConfidence(c float32) float32 {
 // closeOpenFacts sets valid_to = now on every currently-open active fact
 // for one (scope, subject, predicate) and returns how many were open.
 //
-// The count and the mutation are two statements, so under concurrency n is
-// a pre-count snapshot: rows inserted between the two land inside the
-// mutation's WHERE clause too, meaning superseded=N can UNDERCOUNT what
-// was actually closed (never overcount). Callers must treat N as
-// best-effort, not exact.
+// The count and the mutation are two statements, so under concurrency n
+// is only a best-effort pre-count and can err in BOTH directions. It
+// UNDERCOUNTS when rows inserted between the count and the ALTER still
+// match the mutation's WHERE clause — closed but unreported. It OVERCOUNTS
+// when a racing second wave reports its stale pre-count even though the
+// winner's wave did all the actual closing.
 //
 // mutations_sync = 1 makes the ALTER wait for completion so a subsequent
 // insert can never be re-closed by its own supersede wave — at Phase-1
