@@ -1,0 +1,5 @@
+/memserved
+/memseed
+/memeval
+*.test
+.env

@@ -1,0 +1,12 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3
+    ports: ["9000:9000", "8123:8123"]
+    environment:
+      CLICKHOUSE_USER: mem
+      CLICKHOUSE_PASSWORD: memdev
+      CLICKHOUSE_DB: mem
+    volumes:
+      - chdata:/var/lib/clickhouse
+volumes:
+  chdata:
