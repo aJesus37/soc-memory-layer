@@ -89,3 +89,126 @@ func TestResolveOrCreate(t *testing.T) {
 		t.Fatalf("scope isolation failed: %+v vs %+v", e3, e1)
 	}
 }
+
+func TestResolveBatch(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	if err := conn.Exec(ctx, "TRUNCATE TABLE mem.entities"); err != nil {
+		t.Fatal(err)
+	}
+	r := NewResolver(conn)
+
+	pre, _, err := r.Resolve(ctx, "default", "existing.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// last_seen is DateTime (second granularity); pause so the batch's
+	// hit-refresh is distinguishable from the creation-time value.
+	time.Sleep(1100 * time.Millisecond)
+
+	raws := []string{
+		"New1.Example.COM",     // new, will dedupe with later variant
+		"1.2.3.4",              // new IP
+		"existing.example.com", // pre-existing hit
+		"not an entity!!",      // unnormalizable -> zero value
+		"new1.example.com",     // duplicate of first
+		"5.6.7.8",              // new IP
+		"T1059.001",            // new technique
+	}
+	got, err := r.ResolveBatch(ctx, "default", raws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(raws) {
+		t.Fatalf("len(got) = %d, want %d", len(got), len(raws))
+	}
+
+	// order + values
+	if got[0].EntityType != "ioc_domain" || got[0].Key != "new1.example.com" {
+		t.Fatalf("got[0] wrong: %+v", got[0])
+	}
+	if got[1].EntityType != "ioc_ip" || got[1].Key != "1.2.3.4" {
+		t.Fatalf("got[1] wrong: %+v", got[1])
+	}
+	if got[2].EntityID != pre.EntityID {
+		t.Fatalf("hit not mapped in input order: %+v vs pre %+v", got[2], pre)
+	}
+	if got[4].EntityID != got[0].EntityID {
+		t.Fatalf("dedup failed: %+v vs %+v", got[4], got[0])
+	}
+	if got[5].Key != "5.6.7.8" || got[6].Key != "T1059.001" {
+		t.Fatalf("tail entries wrong: %+v %+v", got[5], got[6])
+	}
+	if got[3].EntityID != "" || got[3].EntityType != "" || got[3].Key != "" {
+		t.Fatalf("unnormalizable input should be zero value, got %+v", got[3])
+	}
+
+	// created flags via DB check: fresh entities have first_seen == last_seen
+	// (created this second); the refreshed hit has last_seen > first_seen.
+	var freshFirst, freshLast time.Time
+	if err := conn.QueryRow(ctx,
+		"SELECT min(first_seen), max(last_seen) FROM mem.entities WHERE scope = ? AND key = ?",
+		"default", "new1.example.com",
+	).Scan(&freshFirst, &freshLast); err != nil {
+		t.Fatal(err)
+	}
+	if !freshFirst.Equal(freshLast) {
+		t.Fatalf("fresh entity timestamps diverge: first=%v last=%v", freshFirst, freshLast)
+	}
+	var hitFirst, hitLast time.Time
+	if err := conn.QueryRow(ctx,
+		"SELECT min(first_seen), max(last_seen) FROM mem.entities WHERE scope = ? AND entity_type = ? AND key = ?",
+		"default", "ioc_domain", "existing.example.com",
+	).Scan(&hitFirst, &hitLast); err != nil {
+		t.Fatal(err)
+	}
+	if !hitLast.After(hitFirst) {
+		t.Fatalf("hit was not refreshed: first=%v last=%v", hitFirst, hitLast)
+	}
+
+	var n uint64
+	if err := conn.QueryRow(ctx,
+		// uniqExact rather than count(): the refreshed hit still exists as
+		// two unmerged ReplacingMergeTree rows at this point.
+		"SELECT uniqExact(entity_id) FROM mem.entities WHERE scope = 'default'",
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	// 4 distinct entities: new1.example.com, 1.2.3.4, existing.example.com,
+	// 5.6.7.8, T1059.001 — that is 5; the invalid token must not create one.
+	if n != 5 {
+		t.Fatalf("entity row count = %d, want 5 (invalid token must not persist)", n)
+	}
+}
+
+func TestResolveBatchEmpty(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	if err := conn.Exec(ctx, "TRUNCATE TABLE mem.entities"); err != nil {
+		t.Fatal(err)
+	}
+	r := NewResolver(conn)
+	got, err := r.ResolveBatch(ctx, "default", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("len(got) = %d, want 0", len(got))
+	}
+	allInvalid, err := r.ResolveBatch(ctx, "default", []string{"nope", "also nope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, e := range allInvalid {
+		if e.EntityID != "" || e.EntityType != "" || e.Key != "" {
+			t.Fatalf("all-invalid batch[%d] = %+v, want zero value", i, e)
+		}
+	}
+	var n uint64
+	if err := conn.QueryRow(ctx, "SELECT count() FROM mem.entities").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("entity rows = %d, want 0", n)
+	}
+}
