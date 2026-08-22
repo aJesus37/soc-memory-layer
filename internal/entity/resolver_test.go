@@ -2,6 +2,7 @@ package entity
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -31,17 +32,22 @@ func itestConn(t *testing.T) driver.Conn {
 	return conn
 }
 
+// itestScope returns a scope unique per test invocation. Tests isolate via
+// scope instead of TRUNCATE so parallel packages sharing one ClickHouse
+// never destroy each other's rows mid-test.
+func itestScope() string {
+	return fmt.Sprintf("itest-%x", time.Now().UnixNano())
+}
+
 func TestResolveOrCreate(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
-	// clean slate for deterministic test
-	if err := conn.Exec(ctx, "TRUNCATE TABLE mem.entities"); err != nil {
-		t.Fatal(err)
-	}
 
+	scopeA := itestScope()
+	scopeB := itestScope()
 	r := NewResolver(conn)
 
-	e1, created, err := r.Resolve(ctx, "default", "Example.COM")
+	e1, created, err := r.Resolve(ctx, scopeA, "Example.COM")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +63,7 @@ func TestResolveOrCreate(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	tBefore := time.Now()
 
-	e2, created2, err := r.Resolve(ctx, "default", "example.com")
+	e2, created2, err := r.Resolve(ctx, scopeA, "example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +77,7 @@ func TestResolveOrCreate(t *testing.T) {
 	var dbLast time.Time
 	if err := conn.QueryRow(ctx,
 		"SELECT max(last_seen) FROM mem.entities WHERE scope = ? AND entity_type = ? AND key = ?",
-		"default", "ioc_domain", "example.com",
+		scopeA, "ioc_domain", "example.com",
 	).Scan(&dbLast); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +87,7 @@ func TestResolveOrCreate(t *testing.T) {
 	}
 
 	// same key different scope = different entity
-	e3, created3, err := r.Resolve(ctx, "team-a", "example.com")
+	e3, created3, err := r.Resolve(ctx, scopeB, "example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,12 +99,10 @@ func TestResolveOrCreate(t *testing.T) {
 func TestResolveBatch(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
-	if err := conn.Exec(ctx, "TRUNCATE TABLE mem.entities"); err != nil {
-		t.Fatal(err)
-	}
+	scope := itestScope()
 	r := NewResolver(conn)
 
-	pre, _, err := r.Resolve(ctx, "default", "existing.example.com")
+	pre, _, err := r.Resolve(ctx, scope, "existing.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +119,7 @@ func TestResolveBatch(t *testing.T) {
 		"5.6.7.8",              // new IP
 		"T1059.001",            // new technique
 	}
-	got, err := r.ResolveBatch(ctx, "default", raws)
+	got, err := r.ResolveBatch(ctx, scope, raws)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +152,7 @@ func TestResolveBatch(t *testing.T) {
 	var freshFirst, freshLast time.Time
 	if err := conn.QueryRow(ctx,
 		"SELECT min(first_seen), max(last_seen) FROM mem.entities WHERE scope = ? AND key = ?",
-		"default", "new1.example.com",
+		scope, "new1.example.com",
 	).Scan(&freshFirst, &freshLast); err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +162,7 @@ func TestResolveBatch(t *testing.T) {
 	var hitFirst, hitLast time.Time
 	if err := conn.QueryRow(ctx,
 		"SELECT min(first_seen), max(last_seen) FROM mem.entities WHERE scope = ? AND entity_type = ? AND key = ?",
-		"default", "ioc_domain", "existing.example.com",
+		scope, "ioc_domain", "existing.example.com",
 	).Scan(&hitFirst, &hitLast); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +174,7 @@ func TestResolveBatch(t *testing.T) {
 	if err := conn.QueryRow(ctx,
 		// uniqExact rather than count(): the refreshed hit still exists as
 		// two unmerged ReplacingMergeTree rows at this point.
-		"SELECT uniqExact(entity_id) FROM mem.entities WHERE scope = 'default'",
+		"SELECT uniqExact(entity_id) FROM mem.entities WHERE scope = ?", scope,
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
@@ -184,18 +188,16 @@ func TestResolveBatch(t *testing.T) {
 func TestResolveBatchEmpty(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
-	if err := conn.Exec(ctx, "TRUNCATE TABLE mem.entities"); err != nil {
-		t.Fatal(err)
-	}
+	scope := itestScope()
 	r := NewResolver(conn)
-	got, err := r.ResolveBatch(ctx, "default", nil)
+	got, err := r.ResolveBatch(ctx, scope, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("len(got) = %d, want 0", len(got))
 	}
-	allInvalid, err := r.ResolveBatch(ctx, "default", []string{"nope", "also nope"})
+	allInvalid, err := r.ResolveBatch(ctx, scope, []string{"nope", "also nope"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,10 +207,12 @@ func TestResolveBatchEmpty(t *testing.T) {
 		}
 	}
 	var n uint64
-	if err := conn.QueryRow(ctx, "SELECT count() FROM mem.entities").Scan(&n); err != nil {
+	if err := conn.QueryRow(ctx,
+		"SELECT uniqExact(entity_id) FROM mem.entities WHERE scope = ?", scope,
+	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Fatalf("entity rows = %d, want 0", n)
+		t.Fatalf("entity rows in %s = %d, want 0", scope, n)
 	}
 }
