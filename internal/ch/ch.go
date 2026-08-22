@@ -25,7 +25,7 @@ const (
 )
 
 // Connect opens a native-protocol connection to ClickHouse and pings it
-// before returning.
+// before returning. The caller owns the returned conn and must Close it.
 func Connect(ctx context.Context, addr, user, pass string, database string) (driver.Conn, error) {
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: []string{addr},
@@ -61,9 +61,17 @@ func ConnectConfig(ctx context.Context, cfg config.Config, database string) (dri
 // been recorded yet. Files run once each in filename order; multi-statement
 // files are supported.
 //
-// Sequential reruns are idempotent. Concurrent invocations from separate
-// processes may race between the applied-check and the record insert and
-// double-record a migration; start migrations from a single process.
+// Reruns are idempotent at the file level (each file is applied at most once
+// per database). ClickHouse has no DDL transactions, so a migration that
+// fails mid-file may leave some statements already applied; on rerun those
+// statements are re-sent. Migration statements MUST therefore use IF NOT
+// EXISTS or other idempotent forms so that a mid-file failure followed by a
+// rerun neither errors nor corrupts state. This convention is enforced by
+// review, not by the runner.
+//
+// Concurrent invocations from separate processes may race between the
+// applied-check and the record insert and double-record a migration; start
+// migrations from a single process.
 func Migrate(ctx context.Context, conn driver.Conn, _ config.Config) error {
 	if err := conn.Exec(ctx,
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", targetDB)); err != nil {
@@ -139,8 +147,9 @@ func migrationApplied(ctx context.Context, conn driver.Conn, name string) (bool,
 // top-level semicolons. The native protocol rejects multi-statement queries
 // (server error 62 "Multi-statements are not allowed"), so statements must be
 // sent one Exec per query. Semicolons inside quoted strings, quoted
-// identifiers, line comments (-- to end of line) and block comments (/* */)
-// do not split. Fragments holding only whitespace or comments are dropped.
+// identifiers, line comments (-- to end of line) and block comments (/* */,
+// nested to a fixed depth) do not split. Fragments holding only whitespace or
+// comments are dropped.
 func splitStatements(script string) []string {
 	var (
 		stmts      []string
@@ -189,15 +198,25 @@ func splitStatements(script string) []string {
 				i += j - 1
 			}
 		case c == '/' && i+1 < len(script) && script[i+1] == '*':
-			j := strings.Index(script[i+2:], "*/")
-			if j < 0 {
-				current.WriteString(script[i:])
-				i = len(script)
-			} else {
-				end := i + 2 + j + 2
-				current.WriteString(script[i:end])
-				i = end - 1
+			end := i + 2
+			for depth := 1; depth > 0; {
+				if end+1 >= len(script) {
+					end = len(script)
+					break
+				}
+				switch {
+				case script[end] == '/' && script[end+1] == '*':
+					depth++
+					end += 2
+				case script[end] == '*' && script[end+1] == '/':
+					depth--
+					end += 2
+				default:
+					end++
+				}
 			}
+			current.WriteString(script[i:end])
+			i = end - 1
 		case c == ';':
 			flush()
 		default:

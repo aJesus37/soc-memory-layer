@@ -49,12 +49,18 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := Migrate(ctx, conn, config.Load()); err != nil {
 		t.Fatal(err)
 	}
+	names, err := migrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var n uint64
 	if err := conn.QueryRow(ctx,
 		"SELECT count() FROM mem.schema_migrations WHERE database = 'mem'").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("recorded migrations: %d", n)
+	if n != uint64(len(names)) {
+		t.Errorf("recorded migrations = %d, want %d (one per embedded .sql file)", n, len(names))
+	}
 }
 
 func TestSplitStatements(t *testing.T) {
@@ -75,6 +81,10 @@ func TestSplitStatements(t *testing.T) {
 		{"semicolon in block comment", "/* x;y */ A;", []string{"/* x;y */ A"}},
 		{"comment-only tail dropped", "A;\n-- done\n", []string{"A"}},
 		{"backtick identifier", "SELECT `col;a` FROM t;", []string{"SELECT `col;a` FROM t"}},
+		{"no trailing semicolon", "A;\nB", []string{"A", "B"}},
+		{"empty input", "", nil},
+		{"whitespace only", "  \n\t ", nil},
+		{"nested block comment", "/* a /* b; */ x;y */ A;", []string{"/* a /* b; */ x;y */ A"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
