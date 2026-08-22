@@ -754,27 +754,34 @@ func TestPromoteFact(t *testing.T) {
 		t.Errorf("promoted row wrong on FINAL read path: %+v", r)
 	}
 
-	// The proposal row is physically closed at or before the promotion.
-	propUUID, _ := uuid.Parse(prop.ID)
-	var vt time.Time
+	// The proposal side is gone from every read path: FINAL resolves the
+	// shared business key to exactly one version — the promoted replacement
+	// — so no open proposed version remains. (A background merge may have
+	// collapsed the consumed proposal row away physically, so looking it up
+	// by its own fact_id is not merge-safe.)
+	var openProp uint64
 	if err := conn.QueryRow(ctx,
-		"SELECT valid_to FROM mem.facts WHERE fact_id = ?", propUUID,
-	).Scan(&vt); err != nil {
+		"SELECT count() FROM mem.facts FINAL "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? AND object_value = ? "+
+			"AND status = 'proposed' AND valid_to > now64(3)",
+		scope, subjUUID, "verdict_malicious", "benign-parked",
+	).Scan(&openProp); err != nil {
 		t.Fatal(err)
 	}
-	if vt.Year() > 2100 || vt.After(promoted.ValidFrom) {
-		t.Errorf("proposal valid_to = %v, want closed at/before %v", vt, promoted.ValidFrom)
+	if openProp != 0 {
+		t.Errorf("open proposed versions after promote = %d, want 0", openProp)
 	}
 
-	// Re-promotion fails both ways: the promoted id resolves to an active
-	// fact ("not proposed"), and the consumed proposal id no longer
-	// resolves at all — its version was replaced on FINAL.
+	// Re-promotion fails both ways with distinct sentinels: the promoted id
+	// resolves to an active fact ("not proposed" → ErrConflict), and the
+	// consumed proposal id no longer resolves at all (→ ErrFactNotFound);
+	// its version was replaced on FINAL.
 	if _, err := s.PromoteFact(ctx, promoted.ID, "human", "analyst-k"); err == nil ||
-		!strings.Contains(err.Error(), "not proposed") {
-		t.Errorf("promoting an active fact: err = %v, want a not-proposed error", err)
+		!errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "not proposed") {
+		t.Errorf("promoting an active fact: err = %v, want a not-proposed error wrapping ErrConflict", err)
 	}
-	if _, err := s.PromoteFact(ctx, prop.ID, "human", "analyst-k"); err == nil {
-		t.Error("re-promoting a consumed proposal id must fail")
+	if _, err := s.PromoteFact(ctx, prop.ID, "human", "analyst-k"); !errors.Is(err, ErrFactNotFound) {
+		t.Errorf("re-promoting a consumed proposal id: err = %v, want ErrFactNotFound", err)
 	}
 
 	// Human gate fails closed for agents and junk/empty actor types.
@@ -785,18 +792,22 @@ func TestPromoteFact(t *testing.T) {
 	}
 
 	// Unknown ids fail cleanly.
-	if _, err := s.PromoteFact(ctx, uuid.NewString(), "human", "analyst-k"); err == nil {
-		t.Error("promoting a nonexistent fact must fail")
+	if _, err := s.PromoteFact(ctx, uuid.NewString(), "human", "analyst-k"); !errors.Is(err, ErrFactNotFound) {
+		t.Errorf("promoting a nonexistent fact: err = %v, want ErrFactNotFound", err)
 	}
 
 	// Audit: exactly one promote_fact row naming the row the transition
-	// wrote; summary carries statuses only, never object values.
+	// wrote; summary carries statuses, confidence and the prior proposal's
+	// id only, never object values.
 	op, actorType, table, summary := queryAudit(t, conn, ctx, promotedUUID)
 	if op != "promote_fact" || actorType != "human" || table != "facts" {
 		t.Errorf("audit shape wrong: op=%q actor=%q table=%q", op, actorType, table)
 	}
 	if !strings.Contains(summary, "from=proposed") || !strings.Contains(summary, "to=active") {
 		t.Errorf("payload_summary missing transition states: %q", summary)
+	}
+	if !strings.Contains(summary, "prior="+prop.ID) {
+		t.Errorf("payload_summary missing prior id %s: %q", prop.ID, summary)
 	}
 	for _, secret := range []string{"c2", "benign-parked"} {
 		if strings.Contains(summary, secret) {
@@ -904,25 +915,33 @@ func TestRetractFact(t *testing.T) {
 		t.Errorf("retracted row valid_to = %v (valid_from %v), want born closed", vt, vf)
 	}
 
-	// The old active row is physically closed at or before the retraction.
-	activeUUID, _ := uuid.Parse(active.ID)
+	// The old active side is gone from every read path: FINAL resolves the
+	// shared business key to exactly one version — the born-closed retracted
+	// replacement — so no open active version remains. (A background merge
+	// may have collapsed the old row away physically, so looking it up by
+	// its own fact_id is not merge-safe.)
+	var openOld uint64
 	if err := conn.QueryRow(ctx,
-		"SELECT valid_to FROM mem.facts WHERE fact_id = ?", activeUUID,
-	).Scan(&vt); err != nil {
+		"SELECT count() FROM mem.facts FINAL "+
+			"WHERE scope = ? AND subject_id = ? AND predicate = ? AND object_value = ? "+
+			"AND status = 'active' AND valid_to > now64(3)",
+		scope, subjUUID, "verdict_malicious", "c2",
+	).Scan(&openOld); err != nil {
 		t.Fatal(err)
 	}
-	if vt.Year() > 2100 || vt.After(retracted.ValidFrom) {
-		t.Errorf("old row valid_to = %v, want closed at/before %v", vt, retracted.ValidFrom)
+	if openOld != 0 {
+		t.Errorf("open active versions after retract = %d, want 0", openOld)
 	}
 
-	// Re-retraction fails both ways: the consumed active id no longer
-	// resolves on FINAL, and the retracted id resolves to a retracted row.
-	if _, err := s.RetractFact(ctx, active.ID, "again", "human", "analyst-k"); err == nil {
-		t.Error("re-retracting a consumed fact id must fail")
+	// Re-retraction fails both ways with distinct sentinels: the consumed
+	// active id no longer resolves on FINAL (→ ErrFactNotFound), and the
+	// retracted id resolves to a retracted row (→ ErrConflict).
+	if _, err := s.RetractFact(ctx, active.ID, "again", "human", "analyst-k"); !errors.Is(err, ErrFactNotFound) {
+		t.Errorf("re-retracting a consumed fact id: err = %v, want ErrFactNotFound", err)
 	}
 	if _, err := s.RetractFact(ctx, retracted.ID, "again", "human", "analyst-k"); err == nil ||
-		!strings.Contains(err.Error(), "already retracted") {
-		t.Errorf("retracting a retracted fact: err = %v, want an already-retracted error", err)
+		!errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "already retracted") {
+		t.Errorf("retracting a retracted fact: err = %v, want an already-retracted error wrapping ErrConflict", err)
 	}
 
 	// Human gate fails closed for agents and junk/empty actor types.
@@ -933,17 +952,18 @@ func TestRetractFact(t *testing.T) {
 	}
 
 	// Unknown ids fail cleanly.
-	if _, err := s.RetractFact(ctx, uuid.NewString(), "x", "human", "analyst-k"); err == nil {
-		t.Error("retracting a nonexistent fact must fail")
+	if _, err := s.RetractFact(ctx, uuid.NewString(), "x", "human", "analyst-k"); !errors.Is(err, ErrFactNotFound) {
+		t.Errorf("retracting a nonexistent fact: err = %v, want ErrFactNotFound", err)
 	}
 
 	// Audit: exactly one retract_fact row; the reason survives trimmed and
-	// hard-capped at 120 runes, with nothing beyond the cap stored.
+	// hard-capped at 120 runes, with the prior fact's id appended and
+	// nothing beyond the cap stored.
 	op, actorType, table, summary := queryAudit(t, conn, ctx, retrUUID)
 	if op != "retract_fact" || actorType != "human" || table != "facts" {
 		t.Errorf("audit shape wrong: op=%q actor=%q table=%q", op, actorType, table)
 	}
-	if want := "from=active reason=" + long[:120]; summary != want {
+	if want := "from=active reason=" + long[:120] + " prior=" + active.ID; summary != want {
 		t.Errorf("payload_summary = %q, want %q", summary, want)
 	}
 
@@ -974,7 +994,7 @@ func TestRetractFact(t *testing.T) {
 	}
 	propRetrUUID, _ := uuid.Parse(retrProp.ID)
 	op, _, _, summary = queryAudit(t, conn, ctx, propRetrUUID)
-	if op != "retract_fact" || summary != "from=proposed" {
-		t.Errorf("proposal-retract audit: op=%q summary=%q, want from=proposed (empty reason omitted)", op, summary)
+	if want := "from=proposed prior=" + prop.ID; op != "retract_fact" || summary != want {
+		t.Errorf("proposal-retract audit: op=%q summary=%q, want %q (empty reason omitted)", op, summary, want)
 	}
 }

@@ -76,6 +76,20 @@ var farFuture = time.Date(2105, 12, 31, 23, 59, 59, 0, time.UTC)
 // HTTP 403 in a later phase.
 var ErrHumanGated = errors.New("memory: human actor required")
 
+// ErrFactNotFound marks a fact id that does not resolve through the
+// authoritative FINAL read path — either never existed or its version was
+// replaced by a promote/retract transition (consumed ids surface as "not
+// found"; current state lives under the replacement row's own fact_id).
+// Wrapped with context by the load path; check with errors.Is. The API
+// layer maps it to HTTP 404 in a later task.
+var ErrFactNotFound = errors.New("fact not found")
+
+// ErrConflict marks a state transition refused because the fact's current
+// status does not permit it: promoting a fact that is not proposed,
+// retracting a fact that is already retracted. Wrapped with context;
+// check with errors.Is. The API layer maps it to HTTP 409 in a later task.
+var ErrConflict = errors.New("conflicting fact state")
+
 // maxRetractReasonRunes caps the free-text retract reason kept in the
 // audit trail's payload_summary. Counted in runes so multibyte text is
 // never split mid-character.
@@ -237,7 +251,7 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 		// clickhouse-go signals an empty result with io.EOF on some paths
 		// and sql.ErrNoRows on others; both mean "no such fact".
 		if errors.Is(err, io.EOF) || errors.Is(err, sql.ErrNoRows) {
-			return loadedFact{}, fmt.Errorf("memory: fact %s not found", id)
+			return loadedFact{}, fmt.Errorf("memory: fact %s: %w", id, ErrFactNotFound)
 		}
 		return loadedFact{}, fmt.Errorf("memory: load fact %s: %w", id, err)
 	}
@@ -270,12 +284,22 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 // destroy it if the insert then failed; here a failed insert leaves the
 // proposal untouched and retryable.
 //
+// Concurrency: concurrent promote and retract of the same fact race via
+// updated_at. Both transitions gate on the loaded snapshot, then insert a
+// replacement sharing the same ReplacingMergeTree sort key; whichever
+// replacement carries the strictly newer updated_at owns the FINAL read
+// path. updated_at has millisecond precision, so an ms tie is possible and
+// makes the survivor nondeterministic — in particular, a promote that
+// returned success can be shadowed by a winning concurrent retract (and
+// vice versa). Accepted Phase-1 posture; per-key serialization or a
+// compare-and-retry on updated_at is the future remedy.
+//
 // The replacement always gets a fresh fact_id: ClientEventID idempotency
 // belongs to assertions, not to state transitions on existing rows.
 //
 // Audit is best-effort as everywhere: operation='promote_fact',
 // target_id = the row the transition wrote, payload_summary carries
-// statuses and confidence only — never content.
+// statuses, confidence and the prior row's id only — never content.
 func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID string) (Fact, error) {
 	if actorType != actorHuman {
 		return Fact{}, fmt.Errorf("%w: promote_fact by actor type %q", ErrHumanGated, actorType)
@@ -289,7 +313,7 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 		return Fact{}, err
 	}
 	if old.status != Proposed {
-		return Fact{}, fmt.Errorf("memory: fact %s is %q, not proposed", old.factID, old.status)
+		return Fact{}, fmt.Errorf("memory: fact %s is %q, not proposed: %w", old.factID, old.status, ErrConflict)
 	}
 
 	now := time.Now().UTC()
@@ -314,7 +338,7 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
 			"VALUES (?, ?, ?, ?, ?, ?)",
 		actorHuman, author, "promote_fact", "facts", next.factUUID,
-		fmt.Sprintf("from=proposed to=active confidence=%.2f", old.confidence),
+		fmt.Sprintf("from=proposed to=active confidence=%.2f prior=%s", old.confidence, old.factID),
 	); err != nil {
 		s.log.Warn("memory: audit insert failed; fact stands",
 			"operation", "promote_fact",
@@ -346,8 +370,14 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 // trimmed and hard-capped at maxRetractReasonRunes; an empty reason
 // contributes nothing. No other free text is ever persisted by this call.
 //
+// Concurrency: as documented on PromoteFact — concurrent promote and
+// retract of the same fact race via updated_at; an ms tie makes the FINAL
+// survivor nondeterministic, and a returned-success retraction can be
+// shadowed by a winning concurrent promote. Accepted Phase-1 posture.
+//
 // Audit is best-effort: operation='retract_fact', target_id = the row the
-// transition wrote, summary "from=<prior status>" plus the capped reason.
+// transition wrote, summary "from=<prior status>" plus the capped reason
+// and the prior row's id.
 func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, actorID string) (Fact, error) {
 	if actorType != actorHuman {
 		return Fact{}, fmt.Errorf("%w: retract_fact by actor type %q", ErrHumanGated, actorType)
@@ -361,7 +391,7 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 		return Fact{}, err
 	}
 	if old.status == Retracted {
-		return Fact{}, fmt.Errorf("memory: fact %s is already retracted", old.factID)
+		return Fact{}, fmt.Errorf("memory: fact %s is already retracted: %w", old.factID, ErrConflict)
 	}
 
 	now := time.Now().UTC()
@@ -386,6 +416,9 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 	if r := sanitizeReason(reason); r != "" {
 		summary += " reason=" + r
 	}
+	// prior=<old fact uuid> appended last: pure metadata linking the
+	// replacement to the row it superseded (carry-over from review).
+	summary += fmt.Sprintf(" prior=%s", old.factID)
 	if err := s.conn.Exec(ctx,
 		"INSERT INTO mem.audit "+
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
