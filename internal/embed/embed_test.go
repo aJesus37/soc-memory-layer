@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -157,29 +159,82 @@ func TestOpenAIBodyAndPrefix(t *testing.T) {
 	}
 }
 
+func TestFakeUnknownKind(t *testing.T) {
+	f := NewFake(8)
+	if _, err := f.Embed(context.Background(), "bogus", []string{"x"}); err == nil {
+		t.Fatal("unknown kind accepted")
+	}
+}
+
 func TestOpenAIRestoresOrder(t *testing.T) {
+	const n = 10
+	const dim = 768
+	inputs := make([]string, n)
+	for i := range inputs {
+		inputs[i] = fmt.Sprintf("text-%02d", i)
+	}
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Return embeddings out of order: index 1 before index 0.
+		var req struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		if len(req.Input) != n {
+			t.Errorf("len(input) = %d, want %d", len(req.Input), n)
+		}
+		want := make([]string, n)
+		for i, s := range inputs {
+			want[i] = prefixDocument + s
+		}
+		if !reflect.DeepEqual(req.Input, want) {
+			t.Errorf("input = %q, want %q", req.Input, want)
+		}
+
+		// Respond with embeddings in shuffled index order.
+		data := make([]map[string]any, n)
+		for pos, idx := range []int{3, 7, 0, 9, 2, 5, 8, 1, 6, 4} {
+			vec := make([]float32, dim)
+			for j := range vec {
+				vec[j] = float32(idx+1) / float32(j+7)
+			}
+			data[pos] = map[string]any{"index": idx, "embedding": vec}
+		}
+		payload, err := json.Marshal(map[string]any{"data": data})
+		if err != nil {
+			t.Errorf("marshal payload: %v", err)
+			return
+		}
+		// Guard the regression this test locks: n x dim fakes must exceed
+		// the removed 64KiB read cap, else truncation would go unnoticed.
+		if len(payload) <= 64<<10 {
+			t.Errorf("response body = %d bytes, want > %d to exercise the removed cap", len(payload), 64<<10)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"data": []map[string]any{
-				{"index": 1, "embedding": []float32{4, 5, 6}},
-				{"index": 0, "embedding": []float32{1, 2, 3}},
-			},
-		})
+		w.Write(payload)
 	}))
 	defer srv.Close()
 
 	c := NewOpenAI(Config{BaseURL: srv.URL, Model: "m"})
-	vecs, err := c.Embed(context.Background(), "document", []string{"a", "b"})
+	vecs, err := c.Embed(context.Background(), "document", inputs)
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vecs) != 2 {
-		t.Fatalf("len(vecs) = %d, want 2", len(vecs))
+	if len(vecs) != n {
+		t.Fatalf("len(vecs) = %d, want %d", len(vecs), n)
 	}
-	if vecs[0][0] != 1 || vecs[1][0] != 4 {
-		t.Fatalf("order not restored: %v %v", vecs[0], vecs[1])
+	for i := range inputs {
+		if len(vecs[i]) != dim {
+			t.Fatalf("len(vecs[%d]) = %d, want %d", i, len(vecs[i]), dim)
+		}
+		for j := 0; j < dim; j++ {
+			if want := float32(i+1) / float32(j+7); vecs[i][j] != want {
+				t.Fatalf("order not restored at [%d][%d]: got %v, want %v", i, j, vecs[i][j], want)
+			}
+		}
 	}
 }
 
@@ -215,6 +270,21 @@ func TestOpenAIUnknownKind(t *testing.T) {
 	c := NewOpenAI(Config{})
 	if _, err := c.Embed(context.Background(), "bogus", []string{"x"}); err == nil {
 		t.Fatal("unknown kind accepted")
+	}
+}
+
+func TestOpenAIUnconfigured(t *testing.T) {
+	for _, cfg := range []Config{
+		{},
+		{BaseURL: "http://localhost:1234/v1"},
+		{Model: "nomic-embed-text"},
+	} {
+		c := NewOpenAI(cfg)
+		if _, err := c.Embed(context.Background(), "document", []string{"x"}); err == nil {
+			t.Fatalf("cfg %+v: Embed succeeded on unconfigured client", cfg)
+		} else if !strings.Contains(err.Error(), "not configured") {
+			t.Fatalf("cfg %+v: error %q missing \"not configured\"", cfg, err)
+		}
 	}
 }
 

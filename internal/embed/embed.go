@@ -3,6 +3,7 @@ package embed
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"math/rand"
@@ -24,11 +25,21 @@ type Fake struct {
 // FNV-1a hash of (kind + "\x00" + text) seeds dim values from math/rand,
 // then L2-normalized. Same text+kind always yields identical vectors;
 // different texts almost never collide.
+//
+// Vectors carry NO semantic structure: nearest neighbors are arbitrary
+// but stable. Tests must derive expected ranks from the fake's outputs,
+// never from text intuition.
 func NewFake(dim int) *Fake {
 	return &Fake{dim: dim}
 }
 
 func (f *Fake) Embed(_ context.Context, kind string, texts []string) ([][]float32, error) {
+	switch kind {
+	case "document", "query":
+	default:
+		return nil, fmt.Errorf("embed: unknown kind %q (want \"document\" or \"query\")", kind)
+	}
+
 	out := make([][]float32, len(texts))
 	for i, text := range texts {
 		h := fnv.New64a()

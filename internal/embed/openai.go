@@ -32,7 +32,9 @@ type OpenAI struct {
 	client *http.Client
 }
 
-// NewOpenAI returns a client for cfg.BaseURL.
+// NewOpenAI returns a client for cfg.BaseURL. BaseURL and Model must be
+// non-empty; since the constructor cannot fail, unconfigured clients are
+// rejected at Embed time instead.
 func NewOpenAI(cfg Config) *OpenAI {
 	httpClient := cfg.HTTP
 	if httpClient == nil {
@@ -65,6 +67,10 @@ type openAIResponse struct {
 
 // Embed implements Embedder. Empty input returns nil without an API call.
 func (c *OpenAI) Embed(ctx context.Context, kind string, texts []string) ([][]float32, error) {
+	if c.cfg.BaseURL == "" || c.cfg.Model == "" {
+		return nil, fmt.Errorf("embed: BaseURL/Model not configured")
+	}
+
 	switch kind {
 	case "document":
 		kind = prefixDocument
@@ -101,7 +107,7 @@ func (c *OpenAI) Embed(ctx context.Context, kind string, texts []string) ([][]fl
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("embed: read response: %w", err)
 	}
