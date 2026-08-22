@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/uuid"
@@ -41,11 +42,12 @@ func insertEdge(t *testing.T, ctx context.Context, conn driver.Conn, scope, src,
 
 // TestEnrich seeds one entity through the public write path with an open
 // active fact, a superseded fact (same predicate, different value asserted
-// later) and a retracted fact (assert then retract), plus three linked
-// observations of different ages. Enrich must return exactly the open
-// active fact, all three observations newest-first, no neighbors yet — and
-// handle unknown keys and foreign scopes as a clean Found=false miss with
-// empty slices and no error.
+// later), a retracted fact (assert then retract) and a raw-planted EXPIRED
+// fact (valid_to already in the past), plus three linked observations of
+// different ages. Enrich must return exactly the open active fact, all
+// three observations newest-first, no neighbors yet — and handle unknown
+// keys and foreign scopes as a clean Found=false miss with empty slices
+// and no error.
 func TestEnrich(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
@@ -117,6 +119,31 @@ func TestEnrich(t *testing.T) {
 		}
 	}
 
+	// Plant an EXPIRED fact directly (bypasses AssertFact): status still
+	// 'active' and valid_from in the past, but valid_to already elapsed —
+	// only the enrich validity window (valid_to > now) can exclude it.
+	// Distinct predicate keeps it its own FINAL survivor, so no updated_at
+	// wave ordering is needed.
+	expBatch, err := conn.PrepareBatch(ctx,
+		"INSERT INTO mem.facts "+
+			"(fact_id, scope, subject_id, predicate, object_value, object_id, "+
+			"status, confidence, source_obs, written_by, valid_from, valid_to, updated_at)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bornAt := time.Now().UTC().Add(-2 * time.Hour)
+	if err := expBatch.Append(
+		uuid.New(), scope, uuid.MustParse(subj.EntityID),
+		"expired_canary", "must-not-leak",
+		nil, string(Active), float32(0.99), uuid.Nil, "sensor-7",
+		bornAt, bornAt.Add(time.Hour), bornAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := expBatch.Send(); err != nil {
+		t.Fatal(err)
+	}
+
 	res, err := s.Enrich(ctx, scope, "bad.example.com", entity.IocDomain)
 	if err != nil {
 		t.Fatal(err)
@@ -143,6 +170,11 @@ func TestEnrich(t *testing.T) {
 	if fv.ID == f1.ID {
 		t.Fatal("superseded fact leaked into open-fact view")
 	}
+	for _, f := range res.Facts {
+		if f.Predicate == "expired_canary" {
+			t.Fatalf("expired fact leaked into open-fact view: %+v", f)
+		}
+	}
 
 	// Observations newest first.
 	if len(res.Observations) != 3 || !res.Observations[0].Ts.After(res.Observations[2].Ts) {
@@ -156,8 +188,8 @@ func TestEnrich(t *testing.T) {
 		if o.Kind != "alert" {
 			t.Errorf("observation kind = %q, want alert", o.Kind)
 		}
-		if len(o.Excerpt) > 200 {
-			t.Errorf("excerpt longer than 200 chars (%d): %q", len(o.Excerpt), o.Excerpt)
+		if n := utf8.RuneCountInString(o.Excerpt); n > maxExcerptRunes {
+			t.Errorf("excerpt longer than %d runes (%d): %q", maxExcerptRunes, n, o.Excerpt)
 		}
 		if seenObs[o.ID] {
 			t.Errorf("duplicate observation %s in view", o.ID)
