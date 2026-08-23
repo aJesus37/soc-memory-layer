@@ -13,6 +13,8 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
+	_ "socmem/docs"
+
 	"socmem/internal/api"
 	"socmem/internal/ch"
 	"socmem/internal/config"

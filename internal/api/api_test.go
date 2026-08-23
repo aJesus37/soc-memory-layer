@@ -14,6 +14,9 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/uuid"
+
+	_ "socmem/docs" // registers the swagger spec for the /swagger/doc.json route
+
 	"socmem/internal/ch"
 	"socmem/internal/config"
 	"socmem/internal/embed"
@@ -503,6 +506,23 @@ func TestHealthzAndSpoofing(t *testing.T) {
 	rec = do(t, h, "GET", "/v1/enrich?type=ioc_ip&key=1.1.1.1", nil, newIdentity(t, "human"), nil)
 	if got := rec.Header().Get("X-Mem-Actor"); got != "human:actor-human" {
 		t.Fatalf("X-Mem-Actor echo wrong: %q", got)
+	}
+
+	// Swagger spec is served from the registry the generated docs package
+	// populates at init — no service/DB interaction, but routed through the
+	// same mux, so assert it as part of this integration flow.
+	rec = do(t, h, "GET", "/swagger/doc.json", nil, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("swagger doc.json got %d want 200", rec.Code)
+	}
+	var spec struct {
+		Paths map[string]json.RawMessage `json:"paths"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &spec); err != nil {
+		t.Fatalf("doc.json not parseable JSON: %v — body: %s", err, rec.Body.String())
+	}
+	if _, ok := spec.Paths["/v1/enrich"]; !ok {
+		t.Fatalf("doc.json paths missing /v1/enrich")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/swaggo/http-swagger"
 
 	"socmem/internal/ch"
 	"socmem/internal/config"
@@ -50,9 +51,21 @@ func New(svc *memory.Service, conn driver.Conn, cfg config.Config) *Server {
 
 // Routes builds the handler tree. Go 1.22 method+path patterns; no router dep.
 // Write endpoints pass through writeLimit (per-agent budget; humans exempt).
+//
+// Swagger wiring (stdlib mux, no gin): httpSwagger.Handler alone serves the
+// whole UI tree under /swagger/ — index.html plus embedded swagger-ui assets
+// from swaggo/files, and /swagger/doc.json streamed from the spec registry
+// that the generated socmem/docs package populates via its init (imported
+// blank in cmd/memserved). The UI itself never touches disk. The committed
+// docs/swagger.{json,yaml} remain for external consumers and are also served
+// raw at /docs/ from the working directory — best-effort artifact browsing
+// that 404s harmlessly when the binary runs elsewhere.
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.Handle("GET /swagger/", httpSwagger.Handler())
+	mux.Handle("GET /docs/",
+		http.StripPrefix("/docs/", http.FileServer(http.Dir("docs"))))
 	mux.Handle("POST /v1/observations", s.identity(s.writeLimit(s.handleCreateObservation)))
 	mux.Handle("POST /v1/facts", s.identity(s.writeLimit(s.handleAssertFact)))
 	mux.Handle("POST /v1/facts/{id}/promote", s.identity(s.writeLimit(s.handlePromoteFact)))
