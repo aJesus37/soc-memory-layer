@@ -47,15 +47,15 @@ type seedLine struct {
 // through the entity resolver (created on first sight), matching how the
 // API resolves keys.
 type factLine struct {
-	Scope        string  `json:"scope"`
-	SubjectKey   string  `json:"subject_key"`
-	Predicate    string  `json:"predicate"`
-	ObjectValue  string  `json:"object_value"`
-	ObjectKey    string  `json:"object_key,omitempty"`
-	Confidence   float32 `json:"confidence,omitempty"`
-	ActorType    string  `json:"actor_type,omitempty"`
-	ActorID      string  `json:"actor_id,omitempty"`
-	ClientEventID string `json:"client_event_id,omitempty"`
+	Scope         string  `json:"scope"`
+	SubjectKey    string  `json:"subject_key"`
+	Predicate     string  `json:"predicate"`
+	ObjectValue   string  `json:"object_value"`
+	ObjectKey     string  `json:"object_key,omitempty"`
+	Confidence    float32 `json:"confidence,omitempty"`
+	ActorType     string  `json:"actor_type,omitempty"`
+	ActorID       string  `json:"actor_id,omitempty"`
+	ClientEventID string  `json:"client_event_id,omitempty"`
 }
 
 func main() {
@@ -176,8 +176,9 @@ func main() {
 
 // seedFacts asserts human facts from a JSONL file:
 // {"scope":"team-a","subject_key":"evil.example.com","predicate":"resolved_to",
-//  "object_value":"198.51.100.23","object_key":"198.51.100.23","confidence":0.95,
-//  "actor_type":"human","actor_id":"analyst-j"}
+//
+//	"object_value":"198.51.100.23","object_key":"198.51.100.23","confidence":0.95,
+//	"actor_type":"human","actor_id":"analyst-j"}
 func seedFacts(ctx context.Context, logger *slog.Logger, svc *memory.Service, res *entity.Resolver, path string) (int, error) {
 	fh, err := os.Open(path)
 	if err != nil {
@@ -223,14 +224,14 @@ func seedFacts(ctx context.Context, logger *slog.Logger, svc *memory.Service, re
 			objID = obj.EntityID
 		}
 		if _, err := svc.AssertFact(ctx, memory.FactInput{
-			Scope:        fl.Scope,
-			SubjectID:    subj.EntityID,
-			Predicate:    fl.Predicate,
-			ObjectValue:  fl.ObjectValue,
-			ObjectID:     objID,
-			Confidence:   fl.Confidence,
-			ActorType:    actorType,
-			ActorID:      actorID,
+			Scope:       fl.Scope,
+			SubjectID:   subj.EntityID,
+			Predicate:   fl.Predicate,
+			ObjectValue: fl.ObjectValue,
+			ObjectID:    objID,
+			Confidence:  fl.Confidence,
+			ActorType:   actorType,
+			ActorID:     actorID,
 		}); err != nil {
 			if errors.Is(err, memory.ErrInvalidInput) {
 				logger.Warn("invalid fact line", "line", lineNo, "err", err)
