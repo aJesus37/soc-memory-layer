@@ -361,14 +361,18 @@ func TestStreamableHTTPTwoTokensTwoAttributions(t *testing.T) {
 		t.Fatalf("agent-asserted fact should be proposed: %s (isErr=%v)", factB, isErr)
 	}
 
-	// Scopes confine recall across identities: B cannot see A's observation.
+	// Shared-knowledge contract (flipped from the Phase-1 isolation rule):
+	// token B CAN recall team A's org-wide knowledge about domainA — facts
+	// and internal observations are org-visible by default. Attribution
+	// always travels with each row; only restricted material stays home,
+	// and nothing written in this scenario is restricted.
 	enrB, isErr := callTool(t, cliB, "memory_enrich", map[string]any{
 		"type": "ioc_domain", "key": domainA,
 	})
 	if isErr {
 		t.Fatalf("enrich failed: %s", enrB)
 	}
-	if strings.Contains(enrB, `"found":true`) || strings.Contains(enrB, domainA) {
-		t.Fatalf("token B leaked token A's scope data: %.200s", enrB)
+	if !strings.Contains(enrB, `"found":true`) || !strings.Contains(enrB, domainA) {
+		t.Fatalf("org-wide sharing broken: token B missed team A's knowledge: %.200s", enrB)
 	}
 }

@@ -2,10 +2,7 @@ package memory
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"time"
@@ -38,7 +35,9 @@ const maxEnrichNeighborRows = 200
 
 // FactView is the read-side projection of one open fact (NOT the write-side
 // Fact): only the fields a triage/hunting agent needs, with "" standing in
-// for the zero-UUID source_obs sentinel (unknown provenance).
+// for the zero-UUID source_obs sentinel (unknown provenance). OriginScope
+// names the team whose scope the fact was asserted in — attribution always
+// travels with shared knowledge.
 type FactView struct {
 	ID          string
 	Predicate   string
@@ -48,19 +47,22 @@ type FactView struct {
 	ValidFrom   time.Time
 	WrittenBy   string
 	SourceObs   string
+	OriginScope string
 }
 
 // ObsView is the read-side projection of one observation: metadata plus a
-// 200-rune content excerpt (never the full body).
+// 200-rune content excerpt (never the full body). OriginScope names the
+// originating team's scope.
 type ObsView struct {
-	ID      string
-	Ts      time.Time
-	Kind    string
-	Excerpt string // first maxExcerptRunes runes
+	ID          string
+	Ts          time.Time
+	Kind        string
+	Excerpt     string // first maxExcerptRunes runes
+	OriginScope string
 }
 
-// Neighbor is one 1-hop graph edge touching the enriched entity, in
-// whichever direction it points.
+// Neighbor is one 1-hop graph edge touching the enriched entity or any of
+// its cross-scope siblings, in whichever direction it points.
 type Neighbor struct {
 	EntityID  string
 	Relation  string
@@ -74,25 +76,73 @@ type EnrichResult struct {
 	Found  bool
 	Entity entity.Entity
 
+	// OriginScope is the scope the returned Entity row lives in: the
+	// caller's own scope when a local match exists, otherwise the
+	// originating scope of the first foreign match.
+	OriginScope string
+
 	// Open active facts only, confidence DESC, capped at maxEnrichFacts
 	// (200): an entity accumulating more open predicates needs lifecycle
-	// hygiene (supersede/retract), not bigger payloads.
+	// hygiene (supersede/retract), not bigger payloads. Includes org-wide
+	// facts from other scopes; each carries its own OriginScope.
 	Facts []FactView
 
 	Observations []ObsView  // newest first, max 10
 	Neighbors    []Neighbor // ≤1 hop, both directions, deduped, max 50
 }
 
-// Enrich is the primary read path for triage and hunting agents: given a
+// uuidBinds boxes entity ids as bind parameters.
+func uuidBinds(ids []uuid.UUID) []any {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
+}
+
+// uuidPlaceholders renders "?, ?, ..." for n bind parameters plus the
+// matching arg slice. Every IN list in this file is assembled through it —
+// values are always bound, never interpolated.
+func uuidPlaceholders(ids []uuid.UUID) (string, []any) {
+	return strings.TrimSuffix(strings.Repeat("?, ", len(ids)), ", "), uuidBinds(ids)
+}
+
+// Enrich is the primary read path for triage and hunting agents. Given a
 // scope plus a raw key and entity type, it returns the entity, its open
 // active facts (confidence DESC), its ten most recent observations, and up
 // to fifty deduplicated 1-hop neighbors.
 //
+// Shared-knowledge visibility model (single-org deployment): facts and
+// observations are ORG-VISIBLE by default — every team benefits from every
+// other team's knowledge. Restricted material stays home:
+//
+//   - Entities are matched across ALL scopes sharing (entity_type, key).
+//     The caller's local entity wins when present; otherwise the first
+//     foreign match (deterministic: lexicographically smallest scope) is
+//     returned. Found=true when ANY matching entity exists in any scope.
+//   - Facts: the subject may be any sibling id; rows must pass the
+//     visibility gate `(scope = caller OR visibility = 'org')` on top of
+//     status/validity filters. A visibility='scope' fact is readable only
+//     inside its originating scope.
+//   - Observations: must reference a sibling id and pass
+//     `(scope = caller OR confidentiality = 'internal')` — the schema's
+//     confidentiality column is finally ENFORCED here: internal =
+//     org-readable, restricted = originating-scope-only, newest-first.
+//   - Neighbors: the id set spans all sibling entities across scopes, and
+//     the edges query deliberately carries NO scope filter: edge
+//     EXISTENCE is structural metadata, org-visible by design. Edge
+//     CONTENT requires reading facts, which ARE visibility-filtered above.
+//
+// Attribution always travels: cross-scope FactViews/ObsViews carry
+// OriginScope naming the team that produced them, and the result-level
+// OriginScope labels the returned Entity's home scope.
+//
 // The key is normalized exactly like the write path (entity.Normalize), so
 // callers may pass raw indicator spellings; an unnormalizable key can never
 // match a stored entity because writes always store normalized keys, so it
-// yields Found=false rather than an error. An empty/whitespace scope is
-// likewise an honest miss — nothing was ever written to it.
+// yields Found=false rather than an error. An empty/whitespace scope keeps
+// the honest-miss contract — nothing was ever written to it, and an
+// unscoped caller sees nothing at all.
 //
 // entityType is the caller's claim about the entity discriminator; writes
 // store the type Normalize derives from the key, so a caller-supplied type
@@ -106,8 +156,8 @@ type EnrichResult struct {
 // yield a torn view across sections.
 //
 // TODO(p99): run the facts/observations/neighbors queries concurrently via
-// errgroup as the first p99 lever; the entity lookup must still precede
-// them to produce entID.
+// errgroup as the first p99 lever; the sibling-entity lookup must still
+// precede them to produce the id set.
 //
 // Neighbors come straight from mem.edges (Phase-1 fallback path). This CH
 // query is also the production fallback when the Phase-2 graph store is
@@ -132,59 +182,112 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 		return res, nil
 	}
 	key := n.Key
-	scopedScope := strings.TrimSpace(scope)
-
-	var (
-		entID     uuid.UUID
-		firstSeen time.Time
-		lastSeen  time.Time
-		displayNm string
-		attrs     map[string]string
-	)
-	err = s.conn.QueryRow(ctx,
-		"SELECT entity_id, display_name, attrs, first_seen, last_seen "+
-			"FROM mem.entities FINAL "+
-			"WHERE scope = ? AND entity_type = ? AND key = ?",
-		scopedScope, string(entityType), key,
-	).Scan(&entID, &displayNm, &attrs, &firstSeen, &lastSeen)
-	if err != nil {
-		// clickhouse-go signals an empty result with io.EOF on some paths
-		// and sql.ErrNoRows on others; both mean "no such entity".
-		if errors.Is(err, io.EOF) || errors.Is(err, sql.ErrNoRows) {
-			return res, nil
-		}
-		return EnrichResult{}, fmt.Errorf("memory: enrich lookup %s/%s in scope %q: %w",
-			entityType, key, scopedScope, err)
+	caller := strings.TrimSpace(scope)
+	if caller == "" {
+		// Unscoped callers see nothing at all — an honest miss, not an error.
+		return res, nil
 	}
+
+	// Sibling resolution: every entity row sharing (entity_type, key),
+	// across ALL scopes. FINAL resolves one row per (scope, type, key);
+	// the caller's own scope may or may not be among them. Dropping the
+	// scope predicate gives up the primary-index prefix — an accepted
+	// scan at Phase-1/SOC volumes, revisitable with a (type, key) index.
+	type entMatch struct {
+		id  uuid.UUID
+		sc  string
+		ent entity.Entity
+	}
+	var matches []entMatch
+	entRows, err := s.conn.Query(ctx,
+		"SELECT entity_id, scope, display_name, attrs, first_seen, last_seen "+
+			"FROM mem.entities FINAL "+
+			"WHERE entity_type = ? AND key = ?",
+		string(entityType), key,
+	)
+	if err != nil {
+		return EnrichResult{}, fmt.Errorf("memory: enrich sibling lookup %s/%s: %w",
+			entityType, key, err)
+	}
+	defer entRows.Close()
+	for entRows.Next() {
+		var (
+			m         entMatch
+			entID     uuid.UUID
+			sc        string
+			displayNm string
+			attrs     map[string]string
+			fs, ls    time.Time
+		)
+		if err := entRows.Scan(&entID, &sc, &displayNm, &attrs, &fs, &ls); err != nil {
+			return EnrichResult{}, fmt.Errorf("memory: enrich scan sibling %s/%s: %w",
+				entityType, key, err)
+		}
+		m.id = entID
+		m.sc = sc
+		m.ent = entity.Entity{
+			EntityID:    entID.String(),
+			Scope:       sc,
+			EntityType:  entityType,
+			Key:         key,
+			DisplayName: displayNm,
+			Attrs:       attrs,
+			FirstSeen:   fs,
+			LastSeen:    ls,
+		}
+		matches = append(matches, m)
+	}
+	if err := entRows.Err(); err != nil {
+		return EnrichResult{}, fmt.Errorf("memory: enrich iterate siblings %s/%s: %w",
+			entityType, key, err)
+	}
+	if len(matches) == 0 {
+		return res, nil // honest miss in every scope
+	}
+
+	// Deterministic Entity selection: the caller's local row first, then
+	// foreign rows by lexicographically smallest scope (entity_id breaks
+	// impossible-in-practice FINAL ties).
+	sort.Slice(matches, func(i, j int) bool {
+		li, lj := matches[i].sc == caller, matches[j].sc == caller
+		if li != lj {
+			return li
+		}
+		if matches[i].sc != matches[j].sc {
+			return matches[i].sc < matches[j].sc
+		}
+		return matches[i].id.String() < matches[j].id.String()
+	})
+	chosen := matches[0]
 	res.Found = true
-	res.Entity = entity.Entity{
-		EntityID:    entID.String(),
-		Scope:       scopedScope,
-		EntityType:  entityType,
-		Key:         key,
-		DisplayName: displayNm,
-		Attrs:       attrs,
-		FirstSeen:   firstSeen,
-		LastSeen:    lastSeen,
+	res.OriginScope = chosen.sc
+	res.Entity = chosen.ent
+
+	ids := make([]uuid.UUID, len(matches))
+	for i := range matches {
+		ids[i] = matches[i].id
 	}
 
 	now := time.Now().UTC()
 
 	// Open facts through the authoritative read path (FINAL + validity
 	// window + status='active'): expired, superseded (closed by supersede
-	// mutation) and retracted facts are all excluded here. Scope filter is
-	// mandatory — subject UUIDs are not trusted to be globally unique.
-	// LIMIT is bound to maxEnrichFacts via %d (int, injection-safe).
+	// mutation) and retracted facts are all excluded here. The subject may
+	// live in any scope sharing the key; the visibility gate admits only
+	// the caller's own rows plus org-wide ones. All values bound via ?
+	// placeholders; the LIMIT is bound via %d (int, injection-safe).
+	factPh, factBind := uuidPlaceholders(ids)
 	factRows, err := s.conn.Query(ctx, fmt.Sprintf(
-		"SELECT fact_id, predicate, object_value, status, confidence, valid_from, written_by, source_obs "+
+		"SELECT fact_id, scope, predicate, object_value, status, confidence, valid_from, written_by, source_obs "+
 			"FROM mem.facts FINAL "+
-			"WHERE scope = ? AND subject_id = ? AND status = 'active' "+
+			"WHERE subject_id IN ("+factPh+") AND status = 'active' "+
 			"AND valid_from <= ? AND valid_to > ? "+
+			"AND (scope = ? OR visibility = 'org') "+
 			"ORDER BY confidence DESC, fact_id ASC LIMIT %d", maxEnrichFacts),
-		scopedScope, entID, now, now,
+		append(factBind, now, now, caller)...,
 	)
 	if err != nil {
-		return EnrichResult{}, fmt.Errorf("memory: enrich facts %s: %w", entID, err)
+		return EnrichResult{}, fmt.Errorf("memory: enrich facts %s: %w", chosen.id, err)
 	}
 	defer factRows.Close()
 	for factRows.Next() {
@@ -193,9 +296,9 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 			st     string
 			srcObs uuid.UUID
 		)
-		if err := factRows.Scan(&v.ID, &v.Predicate, &v.ObjectValue, &st,
+		if err := factRows.Scan(&v.ID, &v.OriginScope, &v.Predicate, &v.ObjectValue, &st,
 			&v.Confidence, &v.ValidFrom, &v.WrittenBy, &srcObs); err != nil {
-			return EnrichResult{}, fmt.Errorf("memory: enrich scan fact %s: %w", entID, err)
+			return EnrichResult{}, fmt.Errorf("memory: enrich scan fact %s: %w", chosen.id, err)
 		}
 		v.Status = Status(st)
 		if srcObs != uuid.Nil {
@@ -204,19 +307,24 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 		res.Facts = append(res.Facts, v)
 	}
 	if err := factRows.Err(); err != nil {
-		return EnrichResult{}, fmt.Errorf("memory: enrich iterate facts %s: %w", entID, err)
+		return EnrichResult{}, fmt.Errorf("memory: enrich iterate facts %s: %w", chosen.id, err)
 	}
 
 	// substringUTF8 truncates by runes at the SQL side, matching
-	// maxExcerptRunes; both LIMITs are bound via %d (int, injection-safe).
+	// maxExcerptRunes. The confidentiality gate enforces the observation
+	// side of the model: internal observations are org-readable;
+	// restricted ones stay visible only inside their originating scope.
+	// Both LIMITs are bound via %d (int, injection-safe).
+	obsArr := strings.TrimSuffix(strings.Repeat("toUUID(?), ", len(ids)), ", ")
 	obsRows, err := s.conn.Query(ctx, fmt.Sprintf(
-		"SELECT obs_id, ts, kind, substringUTF8(content, 1, %d) FROM mem.observations "+
-			"WHERE scope = ? AND hasAny(entity_refs, [toUUID(?)]) "+
+		"SELECT obs_id, scope, ts, kind, substringUTF8(content, 1, %d) FROM mem.observations "+
+			"WHERE hasAny(entity_refs, ["+obsArr+"]) "+
+			"AND (scope = ? OR confidentiality = 'internal') "+
 			"ORDER BY ts DESC LIMIT %d", maxExcerptRunes, maxEnrichObservations),
-		scopedScope, entID,
+		append(uuidBinds(ids), caller)...,
 	)
 	if err != nil {
-		return EnrichResult{}, fmt.Errorf("memory: enrich observations %s: %w", entID, err)
+		return EnrichResult{}, fmt.Errorf("memory: enrich observations %s: %w", chosen.id, err)
 	}
 	defer obsRows.Close()
 	for obsRows.Next() {
@@ -225,15 +333,15 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 			obsID uuid.UUID
 			kind  string
 		)
-		if err := obsRows.Scan(&obsID, &o.Ts, &kind, &o.Excerpt); err != nil {
-			return EnrichResult{}, fmt.Errorf("memory: enrich scan observation %s: %w", entID, err)
+		if err := obsRows.Scan(&obsID, &o.OriginScope, &o.Ts, &kind, &o.Excerpt); err != nil {
+			return EnrichResult{}, fmt.Errorf("memory: enrich scan observation %s: %w", chosen.id, err)
 		}
 		o.ID = obsID.String()
 		o.Kind = kind
 		res.Observations = append(res.Observations, o)
 	}
 	if err := obsRows.Err(); err != nil {
-		return EnrichResult{}, fmt.Errorf("memory: enrich iterate observations %s: %w", entID, err)
+		return EnrichResult{}, fmt.Errorf("memory: enrich iterate observations %s: %w", chosen.id, err)
 	}
 
 	// SQL DISTINCT collapses physical MergeTree duplicates (retry inserts
@@ -241,22 +349,25 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 	// cannot crowd distinct neighbors out of the window. Both legs filter
 	// on the validity window (valid_to > now64(3)): closed edges —
 	// superseded or retracted — must vanish from the graph view the moment
-	// their lifecycle wave commits, not after some cleanup job. Cross-scope
-	// duplication is impossible: both legs filter on scope. The budget is
-	// maxEnrichNeighborRows (bound via %d, injection-safe), headroom above
-	// the Go-side cap of maxEnrichNeighbors below.
+	// their lifecycle wave commits, not after some cleanup job. NO scope
+	// filter on either leg: edge existence is structural metadata,
+	// org-visible by design (edge CONTENT is gated by the fact query
+	// above). The budget is maxEnrichNeighborRows (bound via %d,
+	// injection-safe), headroom above the Go-side cap of maxEnrichNeighbors
+	// below.
+	nidPh, nidArgs := uuidPlaceholders(ids)
 	edgeRows, err := s.conn.Query(ctx, fmt.Sprintf(
 		"SELECT DISTINCT nid, relation, dir FROM ("+
 			"SELECT dst_id AS nid, relation, 'out' AS dir FROM mem.edges "+
-			"WHERE scope = ? AND src_id = ? AND valid_to > now64(3) "+
+			"WHERE src_id IN ("+nidPh+") AND valid_to > now64(3) "+
 			"UNION ALL "+
 			"SELECT src_id, relation, 'in' FROM mem.edges "+
-			"WHERE scope = ? AND dst_id = ? AND valid_to > now64(3)"+
+			"WHERE dst_id IN ("+nidPh+") AND valid_to > now64(3)"+
 			") LIMIT %d", maxEnrichNeighborRows),
-		scopedScope, entID, scopedScope, entID,
+		append(nidArgs, nidArgs...)...,
 	)
 	if err != nil {
-		return EnrichResult{}, fmt.Errorf("memory: enrich neighbors %s: %w", entID, err)
+		return EnrichResult{}, fmt.Errorf("memory: enrich neighbors %s: %w", chosen.id, err)
 	}
 	defer edgeRows.Close()
 	type edgeKey struct {
@@ -272,7 +383,7 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 			dir string
 		)
 		if err := edgeRows.Scan(&nid, &rel, &dir); err != nil {
-			return EnrichResult{}, fmt.Errorf("memory: enrich scan neighbor %s: %w", entID, err)
+			return EnrichResult{}, fmt.Errorf("memory: enrich scan neighbor %s: %w", chosen.id, err)
 		}
 		k := edgeKey{nid: nid, rel: rel, dir: dir}
 		if seen[k] {
@@ -286,7 +397,7 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 		})
 	}
 	if err := edgeRows.Err(); err != nil {
-		return EnrichResult{}, fmt.Errorf("memory: enrich iterate neighbors %s: %w", entID, err)
+		return EnrichResult{}, fmt.Errorf("memory: enrich iterate neighbors %s: %w", chosen.id, err)
 	}
 	// Sort then cap so the returned window is deterministic. The post-
 	// DISTINCT SQL budget (maxEnrichNeighborRows) keeps this complete for
