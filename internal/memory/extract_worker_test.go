@@ -211,21 +211,25 @@ func TestRunExtractionOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	var (
-		factID    string
-		srcObs    uuid.UUID
-		writtenBy string
-		status    string
+		factID     string
+		srcObs     uuid.UUID
+		writtenBy  string
+		status     string
+		visibility string
 	)
 	if err := conn.QueryRow(ctx,
-		"SELECT fact_id, source_obs, written_by, status FROM mem.facts FINAL "+
+		"SELECT fact_id, source_obs, written_by, status, visibility FROM mem.facts FINAL "+
 			"WHERE scope = ? AND subject_id = ? AND predicate = ? "+
 			"AND valid_to > now64(3)",
 		scope, subjUUID, "beaconed_to",
-	).Scan(&factID, &srcObs, &writtenBy, &status); err != nil {
+	).Scan(&factID, &srcObs, &writtenBy, &status, &visibility); err != nil {
 		t.Fatal(err)
 	}
 	if Status(status) != Proposed {
 		t.Errorf("extraction fact status = %q, want proposed", status)
+	}
+	if visibility != "org" {
+		t.Errorf("extraction fact visibility = %q, want org (worker never restricts)", visibility)
 	}
 	if srcObs.String() != obs1.ID {
 		t.Errorf("source_obs = %s, want %s", srcObs, obs1.ID)

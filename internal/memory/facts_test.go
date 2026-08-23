@@ -200,6 +200,11 @@ func TestAssertFactSupersedes(t *testing.T) {
 				t.Errorf("payload_summary leaks object value %q: %q", secret, sum)
 			}
 		}
+		// The constant visibility token travels with every fact-write audit
+		// row (both writes default to org) without carrying any content.
+		if !strings.Contains(sum, "vis=org") {
+			t.Errorf("payload_summary missing vis=org token: %q", sum)
+		}
 	}
 	// The superseding write reports how many priors it closed.
 	foundSuperseded := false
@@ -360,6 +365,7 @@ func TestAssertFactValidation(t *testing.T) {
 		"malformed client event id": {Scope: scope, SubjectID: uuid.NewString(), Predicate: "p", ObjectValue: "v", ActorType: "human", ActorID: "a", ClientEventID: "nope"},
 		"malformed object id":       {Scope: scope, SubjectID: uuid.NewString(), Predicate: "p", ObjectValue: "v", ActorType: "human", ActorID: "a", ObjectID: "nope"},
 		"malformed source obs":      {Scope: scope, SubjectID: uuid.NewString(), Predicate: "p", ObjectValue: "v", ActorType: "human", ActorID: "a", SourceObs: "nope"},
+		"bad visibility":            {Scope: scope, SubjectID: uuid.NewString(), Predicate: "p", ObjectValue: "v", ActorType: "human", ActorID: "a", Visibility: "public"},
 	}
 	for name, in := range bad {
 		err := mustErrOf(t, name, func() error {
@@ -810,6 +816,9 @@ func TestPromoteFact(t *testing.T) {
 	if !strings.Contains(summary, "from=proposed") || !strings.Contains(summary, "to=active") {
 		t.Errorf("payload_summary missing transition states: %q", summary)
 	}
+	if !strings.Contains(summary, "vis=org") {
+		t.Errorf("payload_summary missing preserved vis token: %q", summary)
+	}
 	if !strings.Contains(summary, "prior="+prop.ID) {
 		t.Errorf("payload_summary missing prior id %s: %q", prop.ID, summary)
 	}
@@ -971,7 +980,7 @@ func TestRetractFact(t *testing.T) {
 	if op != "retract_fact" || actorType != "human" || table != "facts" {
 		t.Errorf("audit shape wrong: op=%q actor=%q table=%q", op, actorType, table)
 	}
-	if want := "from=active reason=" + long[:120] + " prior=" + active.ID + " edge=n"; summary != want {
+	if want := "from=active reason=" + long[:120] + " prior=" + active.ID + " edge=n vis=org"; summary != want {
 		t.Errorf("payload_summary = %q, want %q", summary, want)
 	}
 
@@ -1002,7 +1011,7 @@ func TestRetractFact(t *testing.T) {
 	}
 	propRetrUUID, _ := uuid.Parse(retrProp.ID)
 	op, _, _, summary = queryAudit(t, conn, ctx, propRetrUUID)
-	if want := "from=proposed prior=" + prop.ID + " edge=n"; op != "retract_fact" || summary != want {
+	if want := "from=proposed prior=" + prop.ID + " edge=n vis=org"; op != "retract_fact" || summary != want {
 		t.Errorf("proposal-retract audit: op=%q summary=%q, want %q (empty reason omitted)", op, summary, want)
 	}
 }

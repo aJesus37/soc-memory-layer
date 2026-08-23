@@ -45,7 +45,12 @@ type FactInput struct {
 	// OnBehalfOf is accepted but NOT persisted in Phase 1 (no facts
 	// column); delegation attribution lands with the API layer / schema
 	// evolution.
-	OnBehalfOf    string
+	OnBehalfOf string
+	// Visibility controls who may read the fact through cross-scope recall
+	// paths (Enrich): "" stores 'org' — readable by every team in the
+	// single-org deployment; "scope" restricts readability to the
+	// originating team's scope. Anything else fails validation.
+	Visibility    string // ""|org|scope (validated)
 	ClientEventID string // optional idempotency hint, same rules as observations
 }
 
@@ -97,6 +102,10 @@ var ErrConflict = errors.New("conflicting fact state")
 // never split mid-character.
 const maxRetractReasonRunes = 120
 
+// validVisibilities is the FactInput.Visibility value set: org = readable
+// by every team; scope = originating team only. Empty input maps to org.
+var validVisibilities = map[string]bool{"org": true, "scope": true}
+
 // AssertFact validates input, applies trust policy via ApplyTrust to decide
 // the new fact's status, persists it, and returns it.
 //
@@ -113,7 +122,9 @@ const maxRetractReasonRunes = 120
 // of who-wrote-what lives in mem.audit (design doc §3/§5).
 //
 // The status column is ALWAYS written explicitly: its schema default is
-// 'active' (fail-open) and must never be relied upon.
+// 'active' (fail-open) and must never be relied upon. The same discipline
+// applies to the visibility column (migration 005): every fact row carries
+// its visibility value explicitly from birth.
 //
 // Concurrency: the close-then-insert sequence is not atomic across
 // processes. Two concurrent AssertFact calls on the same
@@ -138,8 +149,9 @@ const maxRetractReasonRunes = 120
 //
 // Audit is best-effort like RecordObservation's: one content-free summary
 // row per write (operation='assert_fact'), noting how many prior facts the
-// mutation closed (superseded=N) and whether the write carries a graph
-// edge (edge=y|n); failures are logged and swallowed.
+// mutation closed (superseded=N), whether the write carries a graph
+// edge (edge=y|n) and the visibility the row was born with (vis=<v>) —
+// failures are logged and swallowed.
 func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 	fact, err := s.validateFact(in)
 	if err != nil {
@@ -200,8 +212,8 @@ func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 		}
 	}
 
-	summary := fmt.Sprintf("status=%s confidence=%.2f superseded=%d edge=%s",
-		status, conf, superseded, edgeMark)
+	summary := fmt.Sprintf("status=%s confidence=%.2f superseded=%d edge=%s vis=%s",
+		status, conf, superseded, edgeMark, fact.visibility)
 	if err := s.conn.Exec(ctx,
 		"INSERT INTO mem.audit "+
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
@@ -258,6 +270,7 @@ type loadedFact struct {
 	sourceObs   uuid.UUID
 	writtenBy   string
 	validFrom   time.Time
+	visibility  string // 'org' | 'scope'; preserved by promote/retract replacements
 }
 
 // loadFactByID reads one fact version through the authoritative read path
@@ -275,14 +288,15 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 	}
 	var f loadedFact
 	var status string // Enum8 must scan into plain string, then convert
+	var visibility string
 	err = s.conn.QueryRow(ctx,
 		"SELECT scope, subject_id, predicate, object_value, object_id, "+
-			"status, confidence, source_obs, written_by, valid_from "+
+			"status, confidence, source_obs, written_by, valid_from, visibility "+
 			"FROM mem.facts FINAL "+
 			"WHERE fact_id = ? ORDER BY updated_at DESC LIMIT 1",
 		id,
 	).Scan(&f.scope, &f.subjectUUID, &f.predicate, &f.objectValue, &f.objectID,
-		&status, &f.confidence, &f.sourceObs, &f.writtenBy, &f.validFrom)
+		&status, &f.confidence, &f.sourceObs, &f.writtenBy, &f.validFrom, &visibility)
 	if err != nil {
 		// clickhouse-go signals an empty result with io.EOF on some paths
 		// and sql.ErrNoRows on others; both mean "no such fact".
@@ -293,6 +307,7 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 	}
 	f.factID = id
 	f.status = Status(status)
+	f.visibility = visibility
 	return f, nil
 }
 
@@ -304,12 +319,12 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 // exist with status='proposed' (promoting an active or retracted fact is
 // an error). The replacement row then carries the SAME ReplacingMergeTree
 // sort key (scope, subject_id, predicate, object_value) plus the
-// proposal's object_id, source_obs and confidence unchanged, but
-// status='active', written_by set to the promoting actor, and a strictly
-// newer updated_at — so FINAL resolves to the promoted version from the
-// moment the insert lands. Only afterwards is the old proposal row
-// mutate-closed by ITS OWN fact_id (SETTINGS mutations_sync = 1): scoped
-// to one row, never the business key, so sibling open facts sharing
+// proposal's object_id, source_obs, confidence and VISIBILITY unchanged,
+// but status='active', written_by set to the promoting actor, and a
+// strictly newer updated_at — so FINAL resolves to the promoted version
+// from the moment the insert lands. Only afterwards is the old proposal
+// row mutate-closed by ITS OWN fact_id (SETTINGS mutations_sync = 1):
+// scoped to one row, never the business key, so sibling open facts sharing
 // (scope, subject_id, predicate) are untouched. A failed closure cannot
 // corrupt the read path — the replacement already wins FINAL — so it is
 // logged and swallowed, leaving at worst a shadowed row for a later merge
@@ -335,9 +350,9 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 //
 // Audit is best-effort as everywhere: operation='promote_fact',
 // target_id = the row the transition wrote, payload_summary carries
-// statuses, confidence, the prior row's id and an edge=y|n marker (the
-// promoted version minted an edge iff it carries an object_id) only —
-// never content.
+// statuses, confidence, the prior row's id, an edge=y|n marker (the
+// promoted version minted an edge iff it carries an object_id) and the
+// preserved vis=<v> token only — never content.
 func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID string) (Fact, error) {
 	if actorType != actorHuman {
 		return Fact{}, fmt.Errorf("%w: promote_fact by actor type %q", ErrHumanGated, actorType)
@@ -365,6 +380,7 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 		sourceObs:   old.sourceObs,
 		actorType:   actorHuman,
 		actorID:     author,
+		visibility:  old.visibility, // replacement preserves the original visibility
 	}
 	if err := s.insertFact(ctx, next, Active, old.confidence, now); err != nil {
 		return Fact{}, err
@@ -389,8 +405,8 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
 			"VALUES (?, ?, ?, ?, ?, ?)",
 		actorHuman, author, "promote_fact", "facts", next.factUUID,
-		fmt.Sprintf("from=proposed to=active confidence=%.2f prior=%s edge=%s",
-			old.confidence, old.factID, edgeMark),
+		fmt.Sprintf("from=proposed to=active confidence=%.2f prior=%s edge=%s vis=%s",
+			old.confidence, old.factID, edgeMark, next.visibility),
 	); err != nil {
 		s.log.Warn("memory: audit insert failed; fact stands",
 			"operation", "promote_fact",
@@ -406,14 +422,15 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 // a retracted version. HUMAN-GATED like PromoteFact: any non-human actor
 // type fails closed with an error wrapping ErrHumanGated.
 //
-// The replacement row keeps the business key and provenance columns but is
-// BORN CLOSED: valid_to = now, never later than its own valid_from plus
-// the DateTime columns' one-second granularity. Even a reader that ignores
-// FINAL and trusts only the validity window therefore never sees a
-// retracted fact — and FINAL, which prefers the newest version of the
-// shared sort key, agrees. The prior row is then mutate-closed by its own
-// fact_id; failures there are logged and swallowed for the same reason as
-// in PromoteFact: the replacement already owns the read path.
+// The replacement row keeps the business key and provenance columns (its
+// visibility value included) but is BORN CLOSED: valid_to = now, never
+// later than its own valid_from plus the DateTime columns' one-second
+// granularity. Even a reader that ignores FINAL and trusts only the
+// validity window therefore never sees a retracted fact — and FINAL,
+// which prefers the newest version of the shared sort key, agrees. The
+// prior row is then mutate-closed by its own fact_id; failures there are
+// logged and swallowed for the same reason as in PromoteFact: the
+// replacement already owns the read path.
 //
 // Reason handling (documented decision): the free-text reason is
 // human-authored justification ABOUT this decision — metadata for
@@ -429,9 +446,9 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 //
 // Audit is best-effort: operation='retract_fact', target_id = the row the
 // transition wrote, summary "from=<prior status>" plus the capped reason,
-// the prior row's id, and an edge=y|n marker (y iff the fact carries an
-// object endpoint, i.e. its activation minted edges that this transition
-// closes).
+// the prior row's id, an edge=y|n marker (y iff the fact carries an object
+// endpoint, i.e. its activation minted edges that this transition closes)
+// and the preserved vis=<v> token.
 func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, actorID string) (Fact, error) {
 	if actorType != actorHuman {
 		return Fact{}, fmt.Errorf("%w: retract_fact by actor type %q", ErrHumanGated, actorType)
@@ -459,6 +476,7 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 		sourceObs:   old.sourceObs,
 		actorType:   actorHuman,
 		actorID:     author,
+		visibility:  old.visibility, // replacement preserves the original visibility
 	}
 	// Self-closing: born with valid_to = now.
 	if err := s.insertFactRow(ctx, next, Retracted, old.confidence, now, now); err != nil {
@@ -489,9 +507,12 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 	}
 	// prior=<old fact uuid> appended last-but-one: pure metadata linking the
 	// replacement to the row it superseded (carry-over from review), with
-	// edge=y|n after it recording whether this transition closed edge rows.
+	// edge=y|n after it recording whether this transition closed edge rows,
+	// and vis=<v> last confirming the replacement preserved the original
+	// visibility.
 	summary += fmt.Sprintf(" prior=%s", old.factID)
 	summary += fmt.Sprintf(" edge=%s", edgeMark)
+	summary += fmt.Sprintf(" vis=%s", next.visibility)
 	if err := s.conn.Exec(ctx,
 		"INSERT INTO mem.audit "+
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
@@ -546,6 +567,7 @@ type factArgs struct {
 	sourceObs   uuid.UUID  // zero uuid when unknown
 	actorType   string
 	actorID     string
+	visibility  string // 'org' | 'scope'; always written explicitly
 }
 
 func (s *Service) validateFact(in FactInput) (factArgs, error) {
@@ -592,6 +614,15 @@ func (s *Service) validateFact(in FactInput) (factArgs, error) {
 		return factArgs{}, fmt.Errorf("%w: actor id required", ErrInvalidInput)
 	}
 
+	// "" means the org-wide default; explicit values must be exact.
+	visibility := strings.TrimSpace(in.Visibility)
+	if visibility == "" {
+		visibility = "org"
+	}
+	if !validVisibilities[visibility] {
+		return factArgs{}, fmt.Errorf("%w: invalid visibility %q", ErrInvalidInput, in.Visibility)
+	}
+
 	factUUID := ids.New()
 	if cid := strings.TrimSpace(in.ClientEventID); cid != "" {
 		u, err := uuid.Parse(cid)
@@ -611,6 +642,7 @@ func (s *Service) validateFact(in FactInput) (factArgs, error) {
 		sourceObs:   sourceObs,
 		actorType:   in.ActorType,
 		actorID:     actorID,
+		visibility:  visibility,
 	}, nil
 }
 
@@ -799,7 +831,8 @@ func (s *Service) insertFactRow(ctx context.Context, f factArgs, status Status, 
 	b, err := s.conn.PrepareBatch(ctx,
 		"INSERT INTO mem.facts "+
 			"(fact_id, scope, subject_id, predicate, object_value, object_id, "+
-			"status, confidence, source_obs, written_by, valid_from, valid_to, updated_at)")
+			"status, confidence, source_obs, written_by, visibility, "+
+			"valid_from, valid_to, updated_at)")
 	if err != nil {
 		return fmt.Errorf("memory: stage fact insert: %w", err)
 	}
@@ -809,7 +842,8 @@ func (s *Service) insertFactRow(ctx context.Context, f factArgs, status Status, 
 	}
 	if err := b.Append(
 		f.factUUID, f.scope, f.subjectUUID, f.predicate, f.objectValue, objID,
-		string(status), conf, f.sourceObs, f.actorID, validFrom, validTo, validFrom,
+		string(status), conf, f.sourceObs, f.actorID, f.visibility,
+		validFrom, validTo, validFrom,
 	); err != nil {
 		return fmt.Errorf("memory: append fact row: %w", err)
 	}
