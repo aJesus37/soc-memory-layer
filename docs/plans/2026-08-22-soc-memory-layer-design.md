@@ -22,6 +22,7 @@ Non-goals: replacing the SIEM/case management; storing raw telemetry at SIEM sca
 | CH-only, graph-shaped schema | Rejected (for now) | Poor ergonomics for deep/ad-hoc traversal; user wants to enable unpredictable exploratory queries |
 | CH + graph projection (**chosen**) | ✅ | Provenance/audit/rebuildability cheap; degrades gracefully both directions; fits platform capacity (2 stateful services) |
 | Graph-centric temporal KG spine (Zep-style) | Rejected | Puts LLM-extraction errors into the source of truth; heaviest ops |
+| Graph engine (**Dgraph v25**, standalone dev / single alpha prod) | ✅ Chosen | DQL+GraphQL exploration surface for agents; actively maintained under Istari Digital (v25.3.x line); governance risk contained by the rebuildable-projection architecture |
 
 Key architectural rule: **the graph is never a second source of truth.** Edges live in ClickHouse (`mem.edges`); the graph holds a rebuildable copy. Engine swap or corruption ⇒ truncate + replay.
 
@@ -169,7 +170,7 @@ Every write normalizes keys before lookup: domains lowercased + registrable-doma
 
 Backups: native ClickHouse backups only. The graph is cattle.
 
-## 7. Graph engine choice (deferred by design)
+## 7. Graph engine choice (resolved)
 
 Swappable behind the service adapter; decision is a taste call because risk is contained by architecture:
 
@@ -177,7 +178,11 @@ Swappable behind the service adapter; decision is a taste call because risk is c
 - **Neo4j Community** — safest, Cypher ecosystem; single-node CE fine at this scale
 - **FalkorDB/Memgraph** — lighter, smaller ecosystems
 
-Lean: Dgraph acceptable *because* the architecture contains the risk; flip to Neo4j if the team knows Cypher.
+Decision: **Dgraph v25** — standalone (zero) in dev, single alpha node in prod. Projection modeling:
+
+- Nodes keyed by immutable `ch_id` predicate (the ClickHouse UUID), making replay idempotent
+- Edges are a single predicate `related_to` with facets (`relation`, `valid_from`, `valid_to`); `@reverse` keeps inbound hops cheap
+- Closed facts remove their edge links at projection time; ClickHouse remains sole truth
 
 ## 8. Access surfaces
 
@@ -213,9 +218,12 @@ One MCP server makes memory available to any MCP-capable client without per-agen
 3. **Shadow mode:** triage agent memory reads alongside human triage for weeks; compare surfaced vs used before any agent write rights beyond `proposed`.
 4. **Progressive write rights:** hunting agents read day 1; write predicates expand config-driven, driven by audit review.
 
-## 10. Open questions
+## 10. Extraction design: async batched worker ("dreaming-lite")
 
-- Final graph engine pick (deliberately deferred to implementation Phase 2)
+Fact extraction never runs synchronously with ingestion. A background worker polls observations lacking fact coverage every ~30s, a local chat model proposes structured facts, and they enter `facts` with `status='proposed'`; humans gate promotion via the normal promote path. Ingestion latency is unaffected and backlogs drain offline.
+
+## 11. Open questions
+
 - CMDB import format for asset entities
 - Scope taxonomy: how many teams/confidentiality levels on day 1
 - Retention policy per observation kind (TTL values)
