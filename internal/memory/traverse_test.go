@@ -404,3 +404,108 @@ func TestTraverseProjectionLag(t *testing.T) {
 		t.Fatalf("unprojected edges leaked into traverse: %v", shapes(paths))
 	}
 }
+
+// TestTraverseCrossScopeRoot pins org-wide root resolution (shared-knowledge
+// model): team-b seeds an A→B chain; team-a — holding no local row at
+// first — traverses A and still finds the chain, with every node labeled
+// team-b (origin attribution travels with shared knowledge). Once team-a
+// resolves its OWN row for the same key, its local entity must win root
+// resolution and the walk starts there instead.
+func TestTraverseCrossScopeRoot(t *testing.T) {
+	svc, g, conn := itestTwoStores(t)
+	ctx := context.Background()
+	teamB := itestScope()
+	teamA := itestScope()
+
+	aB := resolveOne(t, ctx, conn, teamB, "xscope-a.example.com")
+	bB := resolveOne(t, ctx, conn, teamB, "xscope-b.example.com")
+
+	drainProjections(t, ctx, g, conn) // entities only so far
+	seedEdge(t, ctx, svc, teamB, aB.EntityID, "communicates_with", "beacon", bB.EntityID)
+	drainProjections(t, ctx, g, conn)
+
+	t.Run("foreign root discovered and labeled", func(t *testing.T) {
+		paths, err := svc.Traverse(ctx, teamA, "xscope-a.example.com", entity.IocDomain, "", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := findPath(paths, []string{aB.EntityID, bB.EntityID}, []string{"communicates_with"})
+		if p == nil {
+			t.Fatalf("cross-scope root missed team-b's chain: %v", shapes(paths))
+		}
+		for _, n := range p.Nodes {
+			if n.Scope != teamB {
+				t.Errorf("node %s origin scope = %q, want %q", n.EntityID, n.Scope, teamB)
+			}
+			if n.Key == "" || n.DisplayName == "" {
+				t.Fatalf("unhydrated node in path %s: %+v", pathShape(*p), n)
+			}
+		}
+	})
+
+	t.Run("local root preferred when present", func(t *testing.T) {
+		aA := resolveOne(t, ctx, conn, teamA, "xscope-a.example.com")
+		cA := resolveOne(t, ctx, conn, teamA, "xscope-c.example.com")
+		drainProjections(t, ctx, g, conn)
+		seedEdge(t, ctx, svc, teamA, aA.EntityID, "resolved_to", "local", cA.EntityID)
+		drainProjections(t, ctx, g, conn)
+
+		paths, err := svc.Traverse(ctx, teamA, "xscope-a.example.com", entity.IocDomain, "", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(paths) != 1 {
+			t.Fatalf("local-root traverse got %d paths, want exactly 1: %v", len(paths), shapes(paths))
+		}
+		p := findPath(paths, []string{aA.EntityID, cA.EntityID}, []string{"resolved_to"})
+		if p == nil {
+			t.Fatalf("walk did not start from team-a's local entity: %v", shapes(paths))
+		}
+		for _, n := range p.Nodes {
+			if n.Scope != teamA {
+				t.Errorf("node %s origin scope = %q, want local %q", n.EntityID, n.Scope, teamA)
+			}
+		}
+	})
+}
+
+// TestTraverseMixedScopeChain pins boundary-crossing expansion: a fact
+// asserted in team-a links its subject to an entity that lives in team-b,
+// and team-b chains onward to a third entity. The walk must cross the
+// scope boundary naturally — no per-node scope gate — and every node must
+// arrive labeled with its true origin scope.
+func TestTraverseMixedScopeChain(t *testing.T) {
+	svc, g, conn := itestTwoStores(t)
+	ctx := context.Background()
+	teamA := itestScope()
+	teamB := itestScope()
+
+	aA := resolveOne(t, ctx, conn, teamA, "mixed-a.example.com")
+	bB := resolveOne(t, ctx, conn, teamB, "mixed-b.example.com")
+	cB := resolveOne(t, ctx, conn, teamB, "mixed-c.example.com")
+
+	drainProjections(t, ctx, g, conn) // entities only so far
+
+	// The bridging edge is minted by a TEAM-A fact whose object endpoint is
+	// TEAM-B's entity: one edge, two scopes.
+	seedEdge(t, ctx, svc, teamA, aA.EntityID, "communicates_with", "beacon", bB.EntityID)
+	seedEdge(t, ctx, svc, teamB, bB.EntityID, "resolved_to", "infra", cB.EntityID)
+	drainProjections(t, ctx, g, conn)
+
+	paths, err := svc.Traverse(ctx, teamA, "mixed-a.example.com", entity.IocDomain, "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := findPath(paths, []string{aA.EntityID, bB.EntityID, cB.EntityID},
+		[]string{"communicates_with", "resolved_to"})
+	if p == nil {
+		t.Fatalf("walk did not cross the scope boundary: %v", shapes(paths))
+	}
+	wantScope := []string{teamA, teamB, teamB}
+	for i, n := range p.Nodes {
+		if n.Scope != wantScope[i] {
+			t.Errorf("node %d (%s) origin scope = %q, want %q", i, n.EntityID, n.Scope, wantScope[i])
+		}
+	}
+	noRepeatedNodes(t, paths)
+}
