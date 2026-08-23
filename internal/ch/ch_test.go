@@ -64,6 +64,72 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 }
 
+// TestProjectionWatermarkSeeded asserts the migration seeds exactly one
+// epoch row per projected source, and that a double Migrate (the mid-file
+// failure rerun case) does not double them: plain MergeTree never collapses
+// duplicate inserts, so the seed's WHERE NOT EXISTS guard is load-bearing.
+func TestProjectionWatermarkSeeded(t *testing.T) {
+	ctx := context.Background()
+	conn := testConn(t)
+	// Reset to a pre-migration state so the seed path itself is exercised on
+	// every run instead of trusting leftovers from earlier suites.
+	if err := conn.Exec(ctx, "DROP TABLE IF EXISTS mem.projection_watermark"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec(ctx,
+		"ALTER TABLE mem.schema_migrations DELETE WHERE name = '002_projection.sql' "+
+			"SETTINGS mutations_sync = 1"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := Migrate(ctx, conn, config.Load()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := conn.Query(ctx,
+		"SELECT name, ts FROM mem.projection_watermark ORDER BY name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []struct {
+		Name string
+		TS   time.Time
+	}
+	for rows.Next() {
+		var r struct {
+			Name string
+			TS   time.Time
+		}
+		if err := rows.Scan(&r.Name, &r.TS); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	epoch := time.Unix(0, 0).UTC()
+	want := []struct {
+		Name string
+		TS   time.Time
+	}{
+		{Name: "edges", TS: epoch},
+		{Name: "entities", TS: epoch},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("projection_watermark rows = %v, want exactly %v", got, want)
+	}
+	for i := range want {
+		if got[i].Name != want[i].Name {
+			t.Errorf("row %d name = %q, want %q", i, got[i].Name, want[i].Name)
+		}
+		if !got[i].TS.Equal(epoch) {
+			t.Errorf("watermark %q ts = %v, want epoch", got[i].Name, got[i].TS)
+		}
+	}
+}
+
 func TestSchemaTables(t *testing.T) {
 	ctx := context.Background()
 	conn := testConn(t)
@@ -92,6 +158,7 @@ func TestSchemaTables(t *testing.T) {
 		"facts",
 		"edges",
 		"audit",
+		"projection_watermark",
 		"schema_migrations",
 	}
 	sort.Strings(got)
