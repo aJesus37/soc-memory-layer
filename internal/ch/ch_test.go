@@ -158,6 +158,7 @@ func TestSchemaTables(t *testing.T) {
 		"facts",
 		"edges",
 		"audit",
+		"extract_log",
 		"projection_watermark",
 		"schema_migrations",
 	}
