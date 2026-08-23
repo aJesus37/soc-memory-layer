@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -83,6 +84,10 @@ type extractObs struct {
 //     guaranteed queue progress — a model that deterministically fails on
 //     specific content must not wedge everything behind it. Already-
 //     processed observations keep their proposals and coverage rows.
+//   - Cancellation mid-Propose (context.Canceled/DeadlineExceeded): the
+//     observation is deliberately LEFT UNCOVERED when the run aborts, so a
+//     shutdown race retries it on the next startup instead of permanently
+//     burying a never-attempted observation behind an extract_log row.
 //   - Persistence error while applying ONE proposal (resolution or
 //     AssertFact failure): log-and-skip that proposal; sibling proposals
 //     of the same observation still apply, and the observation is covered.
@@ -118,7 +123,8 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 		}
 
 		proposals, perr := chat.Propose(ctx, o.content)
-		if perr == nil {
+		switch {
+		case perr == nil:
 			n, aerr := s.applyProposals(ctx, o, proposals)
 			asserted += n
 			if aerr != nil {
@@ -126,7 +132,14 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 					"obs_id", o.id,
 					"err", aerr)
 			}
-		} else {
+		case isContextErr(perr):
+			// Shutdown raced the propose: leave the observation UNCOVERED so
+			// the next startup retries it — coverage here would permanently
+			// bury an observation that was never actually processed.
+			s.log.Info("memory: extraction canceled mid-propose; observation left uncovered for retry",
+				"obs_id", o.id)
+			return asserted, fmt.Errorf("memory: propose facts for observation %s: %w", o.id, perr)
+		default:
 			s.log.Warn("memory: extraction propose failed; aborting run",
 				"obs_id", o.id,
 				"err", perr)
@@ -135,7 +148,7 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 		// Coverage lands AFTER processing (an attempt counts only once it
 		// happened) but BEFORE any error return, so both the errored
 		// observation and every earlier one stay covered when the run
-		// aborts here.
+		// aborts here — except cancellation, which returns above.
 		if err := s.logExtractionCoverage(ctx, o.id); err != nil {
 			return asserted, fmt.Errorf("memory: cover observation %s: %w", o.id, err)
 		}
@@ -249,12 +262,18 @@ func (s *Service) logExtractionCoverage(ctx context.Context, obsID uuid.UUID) er
 	return nil
 }
 
+// isContextErr reports whether err carries the ctx-cancellation signal
+// (context.Canceled or context.DeadlineExceeded), including wrapped.
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // RunExtractionLoop ticks RunExtractionOnce every interval until ctx
 // cancels — plain ticker semantics, so the first tick lands one full
 // interval in (the worker is a background poller, not an ingestion-path
-// component; design doc §10). interval must be positive: a non-positive
-// value is refused (logged, loop exits) rather than allowed to spin hot
-// against the database.
+// component; design doc §10). Both arguments are validated: a non-positive
+// interval or batch is refused fast (logged, loop exits) rather than
+// allowed to spin hot against the database.
 //
 // Each tick is panic-isolated: a recovered panic — third-party chat
 // clients included — logs and waits for the next tick instead of killing
@@ -264,6 +283,11 @@ func (s *Service) RunExtractionLoop(ctx context.Context, chat extract.ChatClient
 	if interval <= 0 {
 		s.log.Error("memory: extraction loop refuses non-positive interval",
 			"interval", interval)
+		return
+	}
+	if batch <= 0 {
+		s.log.Error("memory: extraction loop refuses non-positive batch",
+			"batch", batch)
 		return
 	}
 	ticker := time.NewTicker(interval)

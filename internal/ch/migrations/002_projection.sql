@@ -3,10 +3,13 @@
 -- re-run mid-file after a failure).
 --
 -- The cursor is the composite (ts, last_id): pages are read with strict
--- tuple comparison (updated_at, entity_id) > (ts, last_id), which makes
--- projection exactly-once per row version — no skips across same-timestamp
--- page boundaries, no re-reads of the boundary row itself. last_id is the
--- entity_id tiebreaker; '' means "start of time".
+-- tuple comparison (updated_at, toString(entity_id)) > (ts, last_id) — the
+-- id tiebreaker is cast to String so pagination, ORDER BY and the CAS all
+-- share ONE canonical-text total order (ClickHouse's internal UUID byte
+-- order disagrees with text) — which makes projection exactly-once per row
+-- version: no skips across same-timestamp page boundaries, no re-reads of
+-- the boundary row itself. last_id is the entity_id tiebreaker; '' means
+-- "start of time".
 
 CREATE TABLE IF NOT EXISTS mem.projection_watermark (
   name String,

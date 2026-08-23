@@ -647,6 +647,74 @@ func TestProjectEdgesTiebreakerOrderRegression(t *testing.T) {
 	}
 }
 
+// Entity-projector twin of TestProjectEdgesTiebreakerOrderRegression: two
+// entities share ONE updated_at millisecond while their ids sit on opposite
+// sides of the byte-order vs canonical-text-order disagreement (pairUUID
+// sorts before textUUID in ClickHouse's internal UUID order, AFTER it in
+// text). With batch=1 both must project across calls — neither skipped nor
+// duplicated (asserted via ch_id presence) and a clean drain.
+func TestProjectEntitiesTiebreakerOrderRegression(t *testing.T) {
+	ctx := itestCtx(t)
+	s, conn := itestBoth(t)
+
+	scope := "test-entity-tiebreak"
+	const (
+		pairUUID = "df49d9d2-779f-4e9d-8181-62d43121fa57"
+		textUUID = "516926c9-b1ae-46c9-83d6-c98105182371"
+	)
+	sameMs := time.Now().UTC().Truncate(time.Millisecond)
+	for _, tc := range []struct{ id, key string }{
+		{pairUUID, "tiebreak-a.example.net"},
+		{textUUID, "tiebreak-b.example.net"},
+	} {
+		eid, err := uuid.Parse(tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := conn.PrepareBatch(ctx,
+			"INSERT INTO mem.entities "+
+				"(entity_id, scope, entity_type, key, display_name, attrs, first_seen, last_seen, updated_at)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Append(eid, scope, "ioc_domain", tc.key, tc.key,
+			map[string]string{}, sameMs, sameMs, sameMs); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Send(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var total int
+	drained := false
+	for i := 0; i < 10; i++ { // cap: the pre-fix code never drains
+		n, err := graph.ProjectEntities(ctx, s, conn, 1)
+		if err != nil {
+			t.Fatalf("step %d: ProjectEntities: %v", i, err)
+		}
+		total += n
+		if n == 0 {
+			drained = true
+			break
+		}
+	}
+	if !drained || total != 2 {
+		t.Fatalf("entity projection did not drain cleanly (drained=%v total=%d): cursor frozen on tiebreaker mismatch", drained, total)
+	}
+	nodes := fetchNodes(t, s, ctx, pairUUID, textUUID)
+	if len(nodes) != 2 {
+		t.Fatalf("projected %d distinct ch_ids (%+v), want 2", len(nodes), nodes)
+	}
+	for _, id := range []string{pairUUID, textUUID} {
+		if n, ok := nodes[id]; !ok {
+			t.Errorf("ch_id %s missing from projection", id)
+		} else if n.Scope != scope || n.EntityType != "ioc_domain" {
+			t.Errorf("ch_id %s projected wrong content: %+v", id, n)
+		}
+	}
+}
+
 func mustParseUUID(t *testing.T, s string) uuid.UUID {
 	t.Helper()
 	u, err := uuid.Parse(s)

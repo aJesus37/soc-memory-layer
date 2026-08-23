@@ -405,6 +405,53 @@ func TestExtractionDedupesActiveFacts(t *testing.T) {
 	}
 }
 
+// canceledChat simulates a propose racing shutdown: every call fails with
+// context.Canceled, like an HTTP client whose request ctx was canceled
+// mid-flight.
+type canceledChat struct{ calls atomic.Int64 }
+
+func (c *canceledChat) Propose(context.Context, string) ([]extract.Proposal, error) {
+	c.calls.Add(1)
+	return nil, context.Canceled
+}
+
+// Regression: a cancellation mid-Propose must NOT permanently cover the
+// observation — the coverage write is skipped so a shutdown race retries the
+// observation on the next startup instead of burying it forever.
+func TestExtractionCancellationLeavesObservationUncovered(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	drainExtractionBacklog(t, conn)
+
+	o, err := s.RecordObservation(ctx, Input{
+		Scope:     scope,
+		Kind:      "investigation_note",
+		ActorType: "human",
+		ActorID:   "analyst-j",
+		Content:   "shutdown raced this propose: evil.example.net resolved_to 198.51.100.23",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cc := &canceledChat{}
+	n, err := s.RunExtractionOnce(ctx, cc, 5)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if n != 0 {
+		t.Errorf("asserted = %d, want 0", n)
+	}
+	if cc.calls.Load() != 1 {
+		t.Errorf("propose called %d times, want 1", cc.calls.Load())
+	}
+	if extractionCovered(t, conn, ctx, o.ID) {
+		t.Error("canceled propose covered the observation; a shutdown race would bury it forever")
+	}
+}
+
 func TestExtractionLoopCancels(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
@@ -487,6 +534,23 @@ func TestExtractionLoopCancels(t *testing.T) {
 		}
 		if fake.callCount() != 0 {
 			t.Errorf("invalid-interval loop called Propose %d times, want 0", fake.callCount())
+		}
+	})
+
+	t.Run("non-positive batch refuses to spin", func(t *testing.T) {
+		fake := &scriptedFakeChat{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.RunExtractionLoop(ctx, fake, 20*time.Millisecond, 0)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("loop with invalid batch did not exit")
+		}
+		if fake.callCount() != 0 {
+			t.Errorf("invalid-batch loop called Propose %d times, want 0", fake.callCount())
 		}
 	})
 }
