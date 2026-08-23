@@ -32,23 +32,30 @@ const (
 
 // Server wires a memory.Service to HTTP transport concerns.
 type Server struct {
-	svc  *memory.Service
-	conn driver.Conn
-	cfg  config.Config
+	svc     *memory.Service
+	conn    driver.Conn
+	cfg     config.Config
+	limiter *agentLimiter
 }
 
 func New(svc *memory.Service, conn driver.Conn, cfg config.Config) *Server {
-	return &Server{svc: svc, conn: conn, cfg: cfg}
+	return &Server{
+		svc:     svc,
+		conn:    conn,
+		cfg:     cfg,
+		limiter: newAgentLimiter(cfg.AgentRateRPS),
+	}
 }
 
 // Routes builds the handler tree. Go 1.22 method+path patterns; no router dep.
+// Write endpoints pass through writeLimit (per-agent budget; humans exempt).
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.Handle("POST /v1/observations", s.identity(s.handleCreateObservation))
-	mux.Handle("POST /v1/facts", s.identity(s.handleAssertFact))
-	mux.Handle("POST /v1/facts/{id}/promote", s.identity(s.handlePromoteFact))
-	mux.Handle("POST /v1/facts/{id}/retract", s.identity(s.handleRetractFact))
+	mux.Handle("POST /v1/observations", s.identity(s.writeLimit(s.handleCreateObservation)))
+	mux.Handle("POST /v1/facts", s.identity(s.writeLimit(s.handleAssertFact)))
+	mux.Handle("POST /v1/facts/{id}/promote", s.identity(s.writeLimit(s.handlePromoteFact)))
+	mux.Handle("POST /v1/facts/{id}/retract", s.identity(s.writeLimit(s.handleRetractFact)))
 	mux.Handle("GET /v1/enrich", s.identity(s.handleEnrich))
 	mux.Handle("GET /v1/similar", s.identity(s.handleSimilar))
 	mux.Handle("GET /v1/timeline", s.identity(s.handleTimeline))

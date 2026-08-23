@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/google/uuid"
 	"socmem/internal/ch"
 	"socmem/internal/config"
@@ -22,26 +23,9 @@ import (
 
 var apiScopeSeq atomic.Int64
 
-// newIdentity returns header set bound to a unique per-call scope so tests
-// never collide with prior runs on the persistent dev volume.
-func newIdentity(t *testing.T, actorType string) map[string]string {
-	t.Helper()
-	scope := fmt.Sprintf("api-%s-%d-%s", t.Name(), apiScopeSeq.Add(1),
-		strings.ReplaceAll(uuid.NewString(), "-", ""))
-	hdrs := map[string]string{
-		"X-Actor-Type": actorType,
-		"X-Actor-ID":   "actor-" + actorType,
-		"X-Scope":      scope,
-	}
-	if actorType == "agent" {
-		hdrs["X-On-Behalf-Of"] = "analyst-j"
-	}
-	return hdrs
-}
-
-// testServer builds an API server against the integration DB with a fake
-// embedder. Skips when MEM_TEST_CH_ADDR is unset.
-func testServer(t *testing.T) (*Server, http.Handler, *memory.Service, *entity.Resolver) {
+// buildService wires a memory.Service against the integration DB with a fake
+// embedder, running migrations. Skips when MEM_TEST_CH_ADDR is unset.
+func buildService(t *testing.T) (*memory.Service, *entity.Resolver, driver.Conn) {
 	t.Helper()
 	addr := os.Getenv("MEM_TEST_CH_ADDR")
 	if addr == "" {
@@ -58,9 +42,32 @@ func testServer(t *testing.T) (*Server, http.Handler, *memory.Service, *entity.R
 		t.Fatal(err)
 	}
 	res := entity.NewResolver(conn)
-	svc := memory.New(conn, res, embed.NewFake(8), config.Load())
+	return memory.New(conn, res, embed.NewFake(8), config.Load()), res, conn
+}
+
+// testServer builds an API server on top of buildService.
+func testServer(t *testing.T) (*Server, http.Handler, *memory.Service, *entity.Resolver) {
+	t.Helper()
+	svc, res, conn := buildService(t)
 	srv := New(svc, conn, config.Load())
 	return srv, srv.Routes(), svc, res
+}
+
+// newIdentity returns header set bound to a unique per-call scope so tests
+// never collide with prior runs on the persistent dev volume.
+func newIdentity(t *testing.T, actorType string) map[string]string {
+	t.Helper()
+	scope := fmt.Sprintf("api-%s-%d-%s", t.Name(), apiScopeSeq.Add(1),
+		strings.ReplaceAll(uuid.NewString(), "-", ""))
+	hdrs := map[string]string{
+		"X-Actor-Type": actorType,
+		"X-Actor-ID":   "actor-" + actorType,
+		"X-Scope":      scope,
+	}
+	if actorType == "agent" {
+		hdrs["X-On-Behalf-Of"] = "analyst-j"
+	}
+	return hdrs
 }
 
 func envOr(key, def string) string {
