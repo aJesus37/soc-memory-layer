@@ -4,11 +4,23 @@ Shared memory layer for a security operations team: investigations (human +
 agent), alert triage context, and company knowledge — stored in ClickHouse,
 served over HTTP, consumable by analysts and agents alike.
 
-**Status:** Phase 1 complete (memory service core on ClickHouse). Graph
-projection, fact-extraction pipeline, MCP tools = later phases.
+**Status:** Phases 1–2 complete — memory core, Dgraph projection, dreaming-lite
+extraction, MCP server. Phase 3: UUIDv7 identifiers, hyphenated-domain
+extraction, full documentation set.
 
 - Design: `docs/plans/2026-08-22-soc-memory-layer-design.md`
-- Plan: `docs/plans/2026-08-22-phase1-memory-service.md`
+- Plans: `docs/plans/` · Docs index below
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | how everything works end-to-end |
+| [docs/api.md](docs/api.md) + `/swagger/index.html` | HTTP + MCP reference |
+| [docs/data-model.md](docs/data-model.md) | every table, predicate, invariant |
+| [docs/adr/](docs/adr/README.md) | architecture decision records |
+| [docs/development.md](docs/development.md) | setup, conventions, how-to-extend |
+| [docs/runbook.md](docs/runbook.md) | ops procedures & troubleshooting |
 
 ## Quickstart
 
