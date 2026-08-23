@@ -4,6 +4,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -56,6 +57,14 @@ type Observation struct {
 	EntityIDs []string
 	Embedded  bool
 }
+
+// ErrInvalidInput marks caller-input rejection: bad kind/actor/scope/UUID
+// spellings and friends. Every input-validation error in this package wraps
+// it (check with errors.Is), so programmatic callers can distinguish "your
+// line/request was bad" from storage faults without string-sniffing: the
+// API maps it to HTTP 400 via its own sentinels, and memseed counts such
+// lines as skipped while anything else aborts the run.
+var ErrInvalidInput = errors.New("memory: invalid input")
 
 var (
 	validKinds = map[string]bool{
@@ -209,17 +218,17 @@ func (s *Service) embed(ctx context.Context, content string) ([]float32, bool) {
 func validate(in Input) (scope, kind, actorType, actorID, onBehalfOf, conf string, caseID *uuid.UUID, clientEventID string, err error) {
 	scope = strings.TrimSpace(in.Scope)
 	if scope == "" {
-		return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: scope required")
+		return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: scope required", ErrInvalidInput)
 	}
 	if !validKinds[in.Kind] {
-		return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: invalid kind %q", in.Kind)
+		return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: invalid kind %q", ErrInvalidInput, in.Kind)
 	}
 	if !validActorTypes[in.ActorType] {
-		return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: invalid actor type %q", in.ActorType)
+		return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: invalid actor type %q", ErrInvalidInput, in.ActorType)
 	}
 	actorID = strings.TrimSpace(in.ActorID)
 	if actorID == "" {
-		return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: actor id required")
+		return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: actor id required", ErrInvalidInput)
 	}
 	onBehalfOf = strings.TrimSpace(in.OnBehalfOf) // optional, never required
 
@@ -228,17 +237,17 @@ func validate(in Input) (scope, kind, actorType, actorID, onBehalfOf, conf strin
 		conf = "internal"
 	}
 	if !validConf[conf] {
-		return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: invalid confidentiality %q", in.Confidentiality)
+		return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: invalid confidentiality %q", ErrInvalidInput, in.Confidentiality)
 	}
 
 	if strings.TrimSpace(in.Content) == "" {
-		return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: content required")
+		return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: content required", ErrInvalidInput)
 	}
 
 	if cid := strings.TrimSpace(in.CaseID); cid != "" {
 		u, err := uuid.Parse(cid)
 		if err != nil {
-			return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: invalid case id %q", in.CaseID)
+			return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: invalid case id %q: %w", ErrInvalidInput, in.CaseID, err)
 		}
 		caseID = &u
 	}
@@ -247,7 +256,7 @@ func validate(in Input) (scope, kind, actorType, actorID, onBehalfOf, conf strin
 	if clientEventID != "" {
 		u, err := uuid.Parse(clientEventID)
 		if err != nil {
-			return "", "", "", "", "", "", nil, "", fmt.Errorf("memory: invalid client event id %q", in.ClientEventID)
+			return "", "", "", "", "", "", nil, "", fmt.Errorf("%w: invalid client event id %q: %w", ErrInvalidInput, in.ClientEventID, err)
 		}
 		clientEventID = u.String() // canonical form so equivalent spellings collide
 	}

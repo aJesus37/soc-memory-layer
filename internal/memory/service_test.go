@@ -387,8 +387,12 @@ func TestRecordObservationValidation(t *testing.T) {
 		"malformed client event id": {Scope: scope, Kind: "alert", ActorType: "human", ActorID: "a", ClientEventID: "not-a-uuid", Content: "x"},
 	}
 	for name, in := range bad {
-		if _, err := s.RecordObservation(ctx, in); err == nil {
-			t.Errorf("%s: expected validation error, got nil", name)
+		err := mustErrOf(t, name, func() error {
+			_, err := s.RecordObservation(ctx, in)
+			return err
+		})
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("%s: err = %v, want it to wrap ErrInvalidInput", name, err)
 		}
 	}
 

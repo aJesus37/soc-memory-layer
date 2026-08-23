@@ -6,14 +6,16 @@
 //
 // Optional per line: case_id, client_event_id, on_behalf_of, confidentiality.
 //
-// Lines failing validation are counted and skipped (reported at the end);
-// storage/embedding errors abort the run.
+// Lines failing input validation (errors.Is memory.ErrInvalidInput) are
+// counted and skipped (reported at the end); anything else — e.g. storage
+// faults — aborts the run.
 package main
 
 import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -43,7 +45,7 @@ type seedLine struct {
 
 func main() {
 	file := flag.String("file", "", "JSONL file to ingest (required)")
-	dryRun := flag.Bool("dry-run", false, "normalize+resolve only; write nothing")
+	dryRun := flag.Bool("dry-run", false, "parse-check lines only; write nothing")
 	flag.Parse()
 	if *file == "" {
 		fmt.Fprintln(os.Stderr, "usage: memseed -file seeds/history.jsonl [-dry-run]")
@@ -124,7 +126,7 @@ func main() {
 			Ts:              ts,
 			Content:         sl.Content,
 		}); err != nil {
-			if strings.Contains(err.Error(), "must be") || strings.Contains(err.Error(), "required") {
+			if errors.Is(err, memory.ErrInvalidInput) {
 				logger.Warn("invalid line", "line", lineNo, "err", err)
 				skipped++
 				continue

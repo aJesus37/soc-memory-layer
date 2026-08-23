@@ -78,24 +78,24 @@ const timelineObsProjection = "ts, 'observation' AS src, toString(kind) AS kind,
 func (s *Service) Timeline(ctx context.Context, scope, caseID, entityID string, limit, offset int) ([]Event, error) {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
-		return nil, fmt.Errorf("memory: scope required")
+		return nil, fmt.Errorf("%w: scope required", ErrInvalidInput)
 	}
 	caseID = strings.TrimSpace(caseID)
 	entityID = strings.TrimSpace(entityID)
 	if (caseID == "") == (entityID == "") { // both set, or neither
-		return nil, fmt.Errorf("memory: exactly one of case id or entity id required")
+		return nil, fmt.Errorf("%w: exactly one of case id or entity id required", ErrInvalidInput)
 	}
 	if limit < 1 || limit > maxTimelineLimit {
-		return nil, fmt.Errorf("memory: limit must be within [1, %d], got %d", maxTimelineLimit, limit)
+		return nil, fmt.Errorf("%w: limit must be within [1, %d], got %d", ErrInvalidInput, maxTimelineLimit, limit)
 	}
 	if offset < 0 {
-		return nil, fmt.Errorf("memory: offset must be >= 0, got %d", offset)
+		return nil, fmt.Errorf("%w: offset must be >= 0, got %d", ErrInvalidInput, offset)
 	}
 
 	if entityID != "" {
 		entU, err := uuid.Parse(entityID)
 		if err != nil {
-			return nil, fmt.Errorf("memory: invalid entity id %q", entityID)
+			return nil, fmt.Errorf("%w: invalid entity id %q", ErrInvalidInput, entityID)
 		}
 		obsLeg := fmt.Sprintf(
 			"SELECT obs_id AS id, "+timelineObsProjection+" FROM mem.observations "+
@@ -113,7 +113,7 @@ func (s *Service) Timeline(ctx context.Context, scope, caseID, entityID string, 
 
 	caseU, err := uuid.Parse(caseID)
 	if err != nil {
-		return nil, fmt.Errorf("memory: invalid case id %q", caseID)
+		return nil, fmt.Errorf("%w: invalid case id %q", ErrInvalidInput, caseID)
 	}
 
 	subjects, err := s.timelineCaseSubjects(ctx, scope, caseU)

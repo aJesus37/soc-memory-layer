@@ -235,7 +235,7 @@ type loadedFact struct {
 func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, error) {
 	id, err := uuid.Parse(strings.TrimSpace(factID))
 	if err != nil {
-		return loadedFact{}, fmt.Errorf("memory: invalid fact id %q: %w", factID, err)
+		return loadedFact{}, fmt.Errorf("%w: invalid fact id %q: %w", ErrInvalidInput, factID, err)
 	}
 	var f loadedFact
 	var status string // Enum8 must scan into plain string, then convert
@@ -306,7 +306,7 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 	}
 	author := strings.TrimSpace(actorID)
 	if author == "" {
-		return Fact{}, fmt.Errorf("memory: actor id required")
+		return Fact{}, fmt.Errorf("%w: actor id required", ErrInvalidInput)
 	}
 	old, err := s.loadFactByID(ctx, factID)
 	if err != nil {
@@ -384,7 +384,7 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 	}
 	author := strings.TrimSpace(actorID)
 	if author == "" {
-		return Fact{}, fmt.Errorf("memory: actor id required")
+		return Fact{}, fmt.Errorf("%w: actor id required", ErrInvalidInput)
 	}
 	old, err := s.loadFactByID(ctx, factID)
 	if err != nil {
@@ -478,26 +478,26 @@ type factArgs struct {
 func (s *Service) validateFact(in FactInput) (factArgs, error) {
 	scope := strings.TrimSpace(in.Scope)
 	if scope == "" {
-		return factArgs{}, fmt.Errorf("memory: scope required")
+		return factArgs{}, fmt.Errorf("%w: scope required", ErrInvalidInput)
 	}
 	subjectUUID, err := uuid.Parse(strings.TrimSpace(in.SubjectID))
 	if err != nil {
-		return factArgs{}, fmt.Errorf("memory: invalid subject id %q: %w", in.SubjectID, err)
+		return factArgs{}, fmt.Errorf("%w: invalid subject id %q: %w", ErrInvalidInput, in.SubjectID, err)
 	}
 	predicate := strings.TrimSpace(in.Predicate)
 	if predicate == "" {
-		return factArgs{}, fmt.Errorf("memory: predicate required")
+		return factArgs{}, fmt.Errorf("%w: predicate required", ErrInvalidInput)
 	}
 	objectValue := strings.TrimSpace(in.ObjectValue)
 	if objectValue == "" {
-		return factArgs{}, fmt.Errorf("memory: object value required")
+		return factArgs{}, fmt.Errorf("%w: object value required", ErrInvalidInput)
 	}
 
 	var objectID *uuid.UUID
 	if cid := strings.TrimSpace(in.ObjectID); cid != "" {
 		u, err := uuid.Parse(cid)
 		if err != nil {
-			return factArgs{}, fmt.Errorf("memory: invalid object id %q: %w", in.ObjectID, err)
+			return factArgs{}, fmt.Errorf("%w: invalid object id %q: %w", ErrInvalidInput, in.ObjectID, err)
 		}
 		objectID = &u
 	}
@@ -506,24 +506,24 @@ func (s *Service) validateFact(in FactInput) (factArgs, error) {
 	if src := strings.TrimSpace(in.SourceObs); src != "" {
 		u, err := uuid.Parse(src)
 		if err != nil {
-			return factArgs{}, fmt.Errorf("memory: invalid source obs %q: %w", in.SourceObs, err)
+			return factArgs{}, fmt.Errorf("%w: invalid source obs %q: %w", ErrInvalidInput, in.SourceObs, err)
 		}
 		sourceObs = u
 	}
 
 	if !validActorTypes[in.ActorType] {
-		return factArgs{}, fmt.Errorf("memory: invalid actor type %q", in.ActorType)
+		return factArgs{}, fmt.Errorf("%w: invalid actor type %q", ErrInvalidInput, in.ActorType)
 	}
 	actorID := strings.TrimSpace(in.ActorID)
 	if actorID == "" {
-		return factArgs{}, fmt.Errorf("memory: actor id required")
+		return factArgs{}, fmt.Errorf("%w: actor id required", ErrInvalidInput)
 	}
 
 	factUUID := uuid.New()
 	if cid := strings.TrimSpace(in.ClientEventID); cid != "" {
 		u, err := uuid.Parse(cid)
 		if err != nil {
-			return factArgs{}, fmt.Errorf("memory: invalid client event id %q: %w", in.ClientEventID, err)
+			return factArgs{}, fmt.Errorf("%w: invalid client event id %q: %w", ErrInvalidInput, in.ClientEventID, err)
 		}
 		factUUID = u
 	}

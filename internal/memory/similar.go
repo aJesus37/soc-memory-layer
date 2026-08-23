@@ -181,16 +181,16 @@ func buildSimilar(scope string, qvec []float32, vecOK bool, tokens []string, k i
 func (s *Service) Similar(ctx context.Context, scope, query string, k int) ([]SearchHit, error) {
 	q := strings.TrimSpace(query)
 	if q == "" {
-		return nil, fmt.Errorf("memory: query required")
+		return nil, fmt.Errorf("%w: query required", ErrInvalidInput)
 	}
 	scopedScope := strings.TrimSpace(scope)
 	if scopedScope == "" {
 		// Same contract as RecordObservation: scope is mandatory, not a
 		// silent miss.
-		return nil, fmt.Errorf("memory: scope required")
+		return nil, fmt.Errorf("%w: scope required", ErrInvalidInput)
 	}
 	if k < similarKMin || k > similarKMax {
-		return nil, fmt.Errorf("memory: k %d outside [%d,%d]", k, similarKMin, similarKMax)
+		return nil, fmt.Errorf("%w: k %d outside [%d,%d]", ErrInvalidInput, k, similarKMin, similarKMax)
 	}
 
 	tokens := queryTokens(q)

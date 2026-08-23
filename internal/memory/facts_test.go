@@ -362,8 +362,12 @@ func TestAssertFactValidation(t *testing.T) {
 		"malformed source obs":      {Scope: scope, SubjectID: uuid.NewString(), Predicate: "p", ObjectValue: "v", ActorType: "human", ActorID: "a", SourceObs: "nope"},
 	}
 	for name, in := range bad {
-		if _, err := s.AssertFact(ctx, in); err == nil {
-			t.Errorf("%s: expected validation error, got nil", name)
+		err := mustErrOf(t, name, func() error {
+			_, err := s.AssertFact(ctx, in)
+			return err
+		})
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("%s: err = %v, want it to wrap ErrInvalidInput", name, err)
 		}
 	}
 
