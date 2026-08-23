@@ -4,6 +4,7 @@ import "os"
 
 type Config struct {
 	ChAddr       string
+	DgraphAddr   string
 	ChUser       string
 	ChPassword   string
 	ListenAddr   string
@@ -22,6 +23,7 @@ func envOr(key, def string) string {
 func Load() Config {
 	return Config{
 		ChAddr:       envOr("MEM_CH_ADDR", "localhost:9000"),
+		DgraphAddr:   envOr("MEM_DGRAPH_ADDR", "localhost:9080"),
 		ChUser:       envOr("MEM_CH_USER", "mem"),
 		ChPassword:   envOr("MEM_CH_PASSWORD", "memdev"),
 		ListenAddr:   envOr("MEM_LISTEN_ADDR", ":8080"),

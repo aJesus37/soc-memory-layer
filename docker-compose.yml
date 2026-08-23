@@ -13,5 +13,16 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+  dgraph:
+    image: dgraph/standalone:latest
+    ports: ["18080:8080", "9080:9080"]
+    volumes:
+      - dgraph:/dgraph
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 volumes:
   chdata:
+  dgraph:
