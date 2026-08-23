@@ -1,7 +1,9 @@
 // Command memseed backfills historical observations from a JSONL file.
 //
 // Each line: {"ts":"RFC3339","kind":"investigation_note","actor_type":"human",
-//             "actor_id":"analyst-j","scope":"team-a","content":"..."}
+//
+//	"actor_id":"analyst-j","scope":"team-a","content":"..."}
+//
 // Optional per line: case_id, client_event_id, on_behalf_of, confidentiality.
 //
 // Lines failing validation are counted and skipped (reported at the end);
