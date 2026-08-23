@@ -137,23 +137,25 @@ the observation and moves on (no wedge). Review proposals via
 **Extraction is LLM output: treat proposals as untrusted.** They land behind
 the same trust policy, scoping and audit as agent writes.
 
-### MCP server (agents & Claude Desktop)
+### MCP server (agents & opencode)
 
 ```bash
 go build -o memmcp ./cmd/memmcp
 ```
 
-Claude Desktop config snippet:
+opencode config (`opencode.json` project-level or `~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "soc-memory": {
-      "command": "/path/to/memmcp",
-      "env": {
+      "type": "local",
+      "command": ["/path/to/memmcp"],
+      "environment": {
         "MEM_CH_ADDR": "localhost:9000",
         "MEM_MCP_ACTOR_TYPE": "agent",
-        "MEM_MCP_ACTOR_ID": "claude-desktop",
+        "MEM_MCP_ACTOR_ID": "opencode-agent",
         "MEM_MCP_SCOPE": "team-a"
       }
     }
