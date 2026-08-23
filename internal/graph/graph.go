@@ -32,7 +32,7 @@ func Connect(ctx context.Context, addr string) (*Store, error) {
 	s := &Store{c: c}
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := s.Ping(pingCtx); err != nil {
+	if err := s.ping(pingCtx); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("graph: ping %s: %w", addr, err)
 	}
@@ -54,8 +54,17 @@ func (s *Store) Dgraph() *dgo.Dgraph { return s.c }
 // Ping runs a cheap read-only has(key) query so it exercises storage, not
 // just the gRPC dial.
 func (s *Store) Ping(ctx context.Context) error {
-	if _, err := s.c.NewReadOnlyTxn().Query(ctx, pingQuery); err != nil {
+	if err := s.ping(ctx); err != nil {
 		return fmt.Errorf("graph: ping: %w", err)
+	}
+	return nil
+}
+
+// ping is the unprefixed core of Ping; Connect wraps it with the address so
+// the "graph: ping" prefix is applied exactly once.
+func (s *Store) ping(ctx context.Context) error {
+	if _, err := s.c.NewReadOnlyTxn().Query(ctx, pingQuery); err != nil {
+		return err
 	}
 	return nil
 }

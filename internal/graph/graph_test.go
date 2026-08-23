@@ -5,9 +5,19 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/dgraph-io/dgo/v250/protos/api"
 )
+
+// itestCtx bounds each integration test's work so a wedged container fails
+// fast instead of hanging the suite.
+func itestCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
 
 func itestGraph(t *testing.T) *Store {
 	t.Helper()
@@ -15,7 +25,7 @@ func itestGraph(t *testing.T) *Store {
 	if addr == "" {
 		t.Skip("MEM_TEST_DGRAPH_ADDR not set; skipping Dgraph integration test")
 	}
-	s, err := Connect(context.Background(), addr)
+	s, err := Connect(itestCtx(t), addr)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -23,13 +33,27 @@ func itestGraph(t *testing.T) *Store {
 	return s
 }
 
+// TestPingPreSchema pins the bootstrap contract: Ping must succeed on a
+// cluster with no schema and no data yet (DropData leaves predicates empty;
+// has(key) matches nothing but the read still exercises storage).
+func TestPingPreSchema(t *testing.T) {
+	s := itestGraph(t)
+	ctx := itestCtx(t)
+	if err := s.DropData(ctx); err != nil {
+		t.Fatalf("drop data: %v", err)
+	}
+	if err := s.Ping(ctx); err != nil {
+		t.Fatalf("ping on pre-schema cluster: %v", err)
+	}
+}
+
 func TestConnectPings(t *testing.T) {
 	s := itestGraph(t)
-	if err := s.Ping(context.Background()); err != nil {
+	if err := s.Ping(itestCtx(t)); err != nil {
 		t.Fatal(err)
 	}
 	q := s.Dgraph().NewReadOnlyTxn()
-	resp, err := q.Query(context.Background(), `{ me(func: has(key)) { uid } }`)
+	resp, err := q.Query(itestCtx(t), `{ me(func: has(key)) { uid } }`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +63,7 @@ func TestConnectPings(t *testing.T) {
 }
 
 func TestInstallSchemaIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := itestCtx(t)
 	s := itestGraph(t)
 	if err := s.InstallSchema(ctx); err != nil {
 		t.Fatal(err)
@@ -47,16 +71,43 @@ func TestInstallSchemaIdempotent(t *testing.T) {
 	if err := s.InstallSchema(ctx); err != nil {
 		t.Fatalf("second install: %v", err)
 	}
-	preds := schemaPredicates(t, s)
+	schema := readSchema(t, s)
 	for _, want := range []string{"scope", "key", "ch_id", "entity_type", "display_name", "related_to"} {
-		if !preds[want] {
-			t.Errorf("schema missing predicate %q; got %v", want, preds)
+		if _, ok := schema.Predicates[want]; !ok {
+			t.Errorf("schema missing predicate %q; got %v", want, predicateNames(schema))
+		}
+	}
+	if _, ok := schema.Types["Entity"]; !ok {
+		t.Errorf("schema missing type Entity; got %v", typeNames(schema))
+	}
+
+	// Upsert directives are load-bearing: Task-5 projection upserts key every
+	// write on ch_id and (later) scope/key lookups. A silent drift to a
+	// non-upsert predicate makes conflicting mutations fail at runtime.
+	for name, wantTok := range map[string]string{
+		"ch_id": "exact",
+		"scope": "hash",
+		"key":   "hash",
+	} {
+		p, ok := schema.Predicates[name]
+		if !ok {
+			t.Errorf("schema missing predicate %q", name)
+			continue
+		}
+		if len(p.Tokenizer) != 1 || p.Tokenizer[0] != wantTok {
+			t.Errorf("predicate %q tokenizer = %v, want [%s]", name, p.Tokenizer, wantTok)
+		}
+		if !p.Upsert {
+			t.Errorf("predicate %q lost @upsert; raw entry %+v", name, p)
+		}
+		if p.Type != "string" {
+			t.Errorf("predicate %q type = %q, want string", name, p.Type)
 		}
 	}
 }
 
 func TestDropData(t *testing.T) {
-	ctx := context.Background()
+	ctx := itestCtx(t)
 	s := itestGraph(t)
 	if err := s.InstallSchema(ctx); err != nil {
 		t.Fatal(err)
@@ -81,38 +132,82 @@ func TestDropData(t *testing.T) {
 	if n := countKeyNodes(t, s); n != 0 {
 		t.Errorf("has(key) count after DropData = %d, want 0", n)
 	}
-	preds := schemaPredicates(t, s)
+	schema := readSchema(t, s)
 	for _, want := range []string{"scope", "key", "ch_id", "entity_type", "display_name", "related_to"} {
-		if !preds[want] {
-			t.Errorf("schema lost predicate %q after DropData; got %v", want, preds)
+		if _, ok := schema.Predicates[want]; !ok {
+			t.Errorf("schema lost predicate %q after DropData; got %v", want, predicateNames(schema))
 		}
 	}
 }
 
-func schemaPredicates(t *testing.T, s *Store) map[string]bool {
+// schemaEntry is one row of the DQL `schema {}` response.
+type schemaEntry struct {
+	Predicate string   `json:"predicate"`
+	Type      string   `json:"type"`
+	Index     bool     `json:"index"`
+	Tokenizer []string `json:"tokenizer"`
+	Upsert    bool     `json:"upsert"`
+	Reverse   bool     `json:"reverse"`
+	List      bool     `json:"list"`
+}
+
+type schemaType struct {
+	Name   string `json:"name"`
+	Fields []struct {
+		Name string `json:"name"`
+	} `json:"fields"`
+}
+
+type dqlSchema struct {
+	Predicates map[string]schemaEntry
+	Types      map[string]schemaType
+}
+
+func predicateNames(s dqlSchema) []string {
+	names := make([]string, 0, len(s.Predicates))
+	for n := range s.Predicates {
+		names = append(names, n)
+	}
+	return names
+}
+
+func typeNames(s dqlSchema) []string {
+	names := make([]string, 0, len(s.Types))
+	for n := range s.Types {
+		names = append(names, n)
+	}
+	return names
+}
+
+func readSchema(t *testing.T, s *Store) dqlSchema {
 	t.Helper()
-	resp, err := s.Dgraph().NewReadOnlyTxn().Query(context.Background(), "schema {}")
+	resp, err := s.Dgraph().NewReadOnlyTxn().Query(itestCtx(t), "schema {}")
 	if err != nil {
 		t.Fatalf("schema query: %v", err)
 	}
 	var parsed struct {
-		Schema []struct {
-			Predicate string `json:"predicate"`
-		} `json:"schema"`
+		Schema []schemaEntry `json:"schema"`
+		Types  []schemaType  `json:"types"`
 	}
 	if err := json.Unmarshal(resp.Json, &parsed); err != nil {
 		t.Fatalf("decode schema response %s: %v", resp.Json, err)
 	}
-	set := make(map[string]bool, len(parsed.Schema))
-	for _, p := range parsed.Schema {
-		set[p.Predicate] = true
+	out := dqlSchema{
+		Predicates: make(map[string]schemaEntry, len(parsed.Schema)),
+		Types:      make(map[string]schemaType, len(parsed.Types)),
 	}
-	return set
+	for _, p := range parsed.Schema {
+		out.Predicates[p.Predicate] = p
+	}
+	for _, ty := range parsed.Types {
+		out.Types[ty.Name] = ty
+	}
+	return out
 }
 
 func countKeyNodes(t *testing.T, s *Store) int {
 	t.Helper()
-	resp, err := s.Dgraph().NewReadOnlyTxn().Query(context.Background(), `{ q(func: has(key)) { count(uid) } }`)
+	resp, err := s.Dgraph().NewReadOnlyTxn().Query(itestCtx(t), `{ q(func: has(key)) { count(uid) } }`)
 	if err != nil {
 		t.Fatalf("count query: %v", err)
 	}

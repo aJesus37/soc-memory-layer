@@ -25,6 +25,8 @@ const schemaText = `
 	entity_type: string @index(hash) .
 	display_name: string .
 	related_to: [uid] @reverse .
+
+	type Entity { }
 `
 
 // InstallSchema creates or updates the projection schema via Alter.
