@@ -60,6 +60,31 @@ func TestExtractEntityCandidates(t *testing.T) {
 			content: "plain prose without any indicators whatsoever here",
 			want:    nil,
 		},
+		{
+			name:    "hyphenated hostname stays one full-key entity (no partial split)",
+			content: "mcp-smoke-x.example.net resolved_to 9.9.9.9",
+			want:    []string{"mcp-smoke-x.example.net", "9.9.9.9"},
+		},
+		{
+			name:    "hyphenated host with port collapses to host",
+			content: "beacon target mcp-smoke-x.example.net:8443 blocked",
+			want:    []string{"mcp-smoke-x.example.net"},
+		},
+		{
+			name:    "error prose yields no junk entities",
+			content: "ERROR beaconing detected",
+			want:    nil,
+		},
+		{
+			name:    "hyphenated words never fuse across spaces into domains",
+			content: "co-founder tracked state-of-the-art malware toward evil.example.com",
+			want:    []string{"evil.example.com"},
+		},
+		{
+			name:    "numeric hyphen range is not a domain lookalike",
+			content: "scanned 192.168.1-10 overnight",
+			want:    nil,
+		},
 		// TODO(fix): "report.docx" passes the domain label rules (letters in
 		// the TLD) and is linked as ioc_domain. Separating filename
 		// extensions from domain detection is intentionally OUT OF SCOPE for

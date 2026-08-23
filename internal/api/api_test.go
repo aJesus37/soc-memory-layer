@@ -229,6 +229,35 @@ func TestObservationRoundTrip(t *testing.T) {
 	if rec.Code != http.StatusOK || miss.Found {
 		t.Fatalf("unknown enrich got %d found=%v", rec.Code, miss.Found)
 	}
+
+	// Hyphenated hostnames link as ONE full-key ioc_domain — never split at
+	// '-' into partial labels — and are reachable through enrich.
+	var hyp struct {
+		EntityIDs []string `json:"entity_ids"`
+	}
+	rec = do(t, h, "POST", "/v1/observations", map[string]any{
+		"kind":    "human_statement",
+		"content": "mcp-smoke-x.example.net resolved_to 9.9.9.9",
+	}, hdrs, &hyp)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hyphen create failed %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(hyp.EntityIDs) != 2 {
+		t.Fatalf("hyphen observation linked %v, want exactly 2 entities (full domain + ip)", hyp.EntityIDs)
+	}
+	var ed struct {
+		Found  bool `json:"found"`
+		Entity struct {
+			Type string `json:"type"`
+			Key  string `json:"key"`
+		} `json:"entity"`
+	}
+	rec = do(t, h, "GET", "/v1/enrich?type=ioc_domain&key=mcp-smoke-x.example.net", nil, hdrs, &ed)
+	if rec.Code != http.StatusOK || !ed.Found ||
+		ed.Entity.Type != "ioc_domain" || ed.Entity.Key != "mcp-smoke-x.example.net" {
+		t.Fatalf("hyphen enrich got %d found=%v entity=%+v, want full hyphenated key",
+			rec.Code, ed.Found, ed.Entity)
+	}
 }
 
 func TestFactLifecycleOverHTTP(t *testing.T) {

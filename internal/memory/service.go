@@ -276,13 +276,23 @@ func validate(in Input) (scope, kind, actorType, actorID, onBehalfOf, conf strin
 	return scope, in.Kind, in.ActorType, actorID, onBehalfOf, conf, caseID, clientEventID, nil
 }
 
-// extractEntityCandidates splits content on runes outside [A-Za-z0-9.:],
+// extractEntityCandidates splits content on runes outside [A-Za-z0-9.:-],
 // post-processes host:port shaped tokens down to their host part (see
 // stripHostPort), keeps unique candidates in order of first appearance,
 // filters them through entity.Normalize and caps the result at
 // maxEntityCandidates. Junk never consumes cap slots: the cap counts
 // accepted candidates only, so filler text ahead of real indicators cannot
 // crowd them out.
+//
+// Hyphens stay INSIDE tokens: "mcp-smoke-x.example.net" must link as one
+// full-key ioc_domain rather than split at each '-' into partial labels.
+// This is the safe direction of "merge adjacent tokens back with '-'":
+// only runs that a literal hyphen actually joins in the text fuse, so
+// whitespace-separated prose can never fabricate a merged domain (the
+// permissive label rules would accept e.g. "to-evil.example.com" from
+// "to evil.example.com"). entity.Normalize still rejects malformed shapes:
+// leading/trailing hyphens per label, single labels without dots, and
+// numeric-TLD lookalikes such as "192.168.1-10".
 //
 // Note that '[' and ']' are token delimiters, so bracketed IPv6 literals
 // such as "[2001:db8::1]:8080" arrive already split into "2001:db8::1"
@@ -311,7 +321,7 @@ func extractEntityCandidates(content string) []string {
 	for _, r := range content {
 		switch {
 		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9',
-			r == '.', r == ':':
+			r == '.', r == ':', r == '-':
 			cur = append(cur, r)
 		default:
 			flush()
