@@ -17,6 +17,7 @@ import (
 	"socmem/internal/embed"
 	"socmem/internal/entity"
 	"socmem/internal/graph"
+	"socmem/internal/ids"
 )
 
 // maxEntityCandidates bounds entity extraction per observation so a single
@@ -160,7 +161,7 @@ func (s *Service) RecordObservation(ctx context.Context, in Input) (Observation,
 
 	obsID := clientEventID
 	if obsID == "" {
-		obsID = uuid.NewString()
+		obsID = ids.New().String()
 	}
 	b, err := s.conn.PrepareBatch(ctx,
 		"INSERT INTO mem.observations "+

@@ -79,6 +79,11 @@ const (
 //     Dgraph write and the watermark UPDATE replays the same page on the
 //     next call, harmlessly.
 //
+// Mixed id populations: ids minted since Phase 3 are UUIDv7, so toString
+// order is chronological; legacy random-v4 rows textually sort after every
+// v7 row ('5...' > '01a0...'), meaning cursors stay monotonic across the
+// split and "oldest first" replay visits v7-era rows before the legacy tail.
+//
 // Consistency contract: a refresh committing with updated_at below the
 // advanced cursor while a tick is in flight is picked up by that entity's
 // NEXT touch (every Resolve writes a fresh version). The projection is

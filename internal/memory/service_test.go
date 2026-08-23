@@ -206,6 +206,57 @@ func TestRecordObservation(t *testing.T) {
 	}
 }
 
+// TestGeneratedIdentifiersAreUUIDv7 pins the id-generation policy: every
+// identifier the service MINTS is UUIDv7 (the version nibble sits at
+// canonical-text rune index 14), whose textual order is chronological — the
+// property ClickHouse cursor tiebreakers on toString(id) rely on.
+// Caller-supplied ClientEventIDs are exempt by design: retries reuse the
+// caller's id regardless of version.
+func TestGeneratedIdentifiersAreUUIDv7(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+
+	o, err := s.RecordObservation(ctx, Input{
+		Scope:     scope,
+		Kind:      "alert",
+		ActorType: "agent",
+		ActorID:   "sensor-7",
+		Content:   "v7 shape probe toward v7probe.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uuid.Parse(o.ID); err != nil || o.ID[14] != '7' {
+		t.Errorf("obs_id %q not a canonical UUIDv7 (parse err %v)", o.ID, err)
+	}
+	if len(o.EntityIDs) == 0 {
+		t.Fatal("no linked entities to check")
+	}
+	for _, id := range o.EntityIDs {
+		if id[14] != '7' {
+			t.Errorf("entity id %q is not UUIDv7", id)
+		}
+	}
+
+	f, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   o.EntityIDs[0],
+		Predicate:   "verdict_malicious",
+		ObjectValue: "c2",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.ID[14] != '7' {
+		t.Errorf("fact_id %q is not UUIDv7", f.ID)
+	}
+}
+
 func queryAudit(t *testing.T, conn driver.Conn, ctx context.Context, obsID uuid.UUID) (op, actorType, table, summary string) {
 	t.Helper()
 	var count uint64

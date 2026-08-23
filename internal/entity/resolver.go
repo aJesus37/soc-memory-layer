@@ -7,7 +7,8 @@ import (
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"github.com/google/uuid"
+
+	"socmem/internal/ids"
 )
 
 // Entity is a canonical deduplicated actor stored in mem.entities.
@@ -163,7 +164,7 @@ func (r *Resolver) resolveAll(ctx context.Context, scope string, raws []string) 
 		}
 		// Miss: create the entity.
 		p.found = Entity{
-			EntityID:    uuid.NewString(),
+			EntityID:    ids.New().String(),
 			Scope:       scope,
 			EntityType:  p.n.Type,
 			Key:         p.n.Key,

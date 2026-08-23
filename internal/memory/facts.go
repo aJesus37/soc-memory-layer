@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"socmem/internal/ids"
 )
 
 // FactInput is one fact assertion. SubjectID, Predicate and ObjectValue are
@@ -354,7 +356,7 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 
 	now := time.Now().UTC()
 	next := factArgs{
-		factUUID:    uuid.New(),
+		factUUID:    ids.New(),
 		scope:       old.scope,
 		subjectUUID: old.subjectUUID,
 		predicate:   old.predicate,
@@ -448,7 +450,7 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 
 	now := time.Now().UTC()
 	next := factArgs{
-		factUUID:    uuid.New(),
+		factUUID:    ids.New(),
 		scope:       old.scope,
 		subjectUUID: old.subjectUUID,
 		predicate:   old.predicate,
@@ -590,7 +592,7 @@ func (s *Service) validateFact(in FactInput) (factArgs, error) {
 		return factArgs{}, fmt.Errorf("%w: actor id required", ErrInvalidInput)
 	}
 
-	factUUID := uuid.New()
+	factUUID := ids.New()
 	if cid := strings.TrimSpace(in.ClientEventID); cid != "" {
 		u, err := uuid.Parse(cid)
 		if err != nil {
@@ -714,7 +716,7 @@ func (s *Service) insertEdgeIfObject(ctx context.Context, f factArgs, validFrom 
 		return fmt.Errorf("memory: stage edge insert: %w", err)
 	}
 	if err := b.Append(
-		uuid.New(), f.scope, f.subjectUUID, *f.objectID, f.predicate, f.factUUID,
+		ids.New(), f.scope, f.subjectUUID, *f.objectID, f.predicate, f.factUUID,
 		validFrom, farFuture, time.Now().UTC(),
 	); err != nil {
 		return fmt.Errorf("memory: append edge row: %w", err)
