@@ -11,14 +11,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
 	"socmem/internal/api"
 	"socmem/internal/ch"
 	"socmem/internal/config"
 	"socmem/internal/embed"
 	"socmem/internal/entity"
+	"socmem/internal/extract"
 	"socmem/internal/graph"
 	"socmem/internal/memory"
 )
+
+// extractionBatch bounds observations proposed per extraction tick.
+const extractionBatch = 32
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -61,6 +67,7 @@ func main() {
 	// ClickHouse fallback (design §6 failure table) — only a warn marks the
 	// degraded mode. Schema install is idempotent and keeps a fresh
 	// deployment projection-ready without a separate bootstrap step.
+	var gstore *graph.Store
 	if g, err := graph.Connect(ctx, cfg.DgraphAddr); err != nil {
 		logger.Warn("dgraph unavailable; traverse degrades to clickhouse fallback",
 			"addr", cfg.DgraphAddr, "err", err)
@@ -71,7 +78,30 @@ func main() {
 		}
 		svc = svc.WithGraph(g)
 		defer g.Close()
+		gstore = g
 		logger.Info("graph store attached", "addr", cfg.DgraphAddr)
+	}
+
+	// Background workers. Both stop when ctx cancels (signal shutdown);
+	// neither ever touches the request path.
+	if gstore != nil {
+		go runProjectionWorker(ctx, logger, gstore, conn,
+			time.Duration(cfg.ProjectIntervalSeconds)*time.Second)
+	} else {
+		logger.Info("projection worker idle: dgraph not attached")
+	}
+	if cfg.ExtractEnabled {
+		// Same LM Studio endpoint serves embeddings and chat completions in
+		// the dev topology, so EmbedURL doubles as the chat base URL (the
+		// env name is historical; no separate chat URL exists to configure).
+		chat := extract.NewChat(extract.Config{
+			BaseURL: cfg.EmbedURL,
+			Model:   cfg.ExtractModel,
+		})
+		go runExtractionWorker(ctx, logger, svc, chat, cfg.ExtractModel,
+			time.Duration(cfg.ExtractIntervalSeconds)*time.Second)
+	} else {
+		logger.Info("extraction worker disabled")
 	}
 
 	srv := &http.Server{
@@ -103,4 +133,79 @@ func main() {
 		logger.Error("graceful shutdown failed", "err", err)
 	}
 	logger.Info("stopped")
+}
+
+// runProjectionWorker ships ClickHouse changes into Dgraph every interval
+// until ctx cancels: entities first (nodes must exist before edges reference
+// them), then edges — each with its own error log carrying counts, so one
+// failing leg never hides the other's progress. batch 0 selects the
+// projector default.
+func runProjectionWorker(ctx context.Context, logger *slog.Logger, g *graph.Store, conn driver.Conn, interval time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("projection worker panicked", "panic", r)
+		}
+	}()
+	if interval <= 0 {
+		logger.Error("projection worker refuses non-positive interval", "interval", interval)
+		return
+	}
+	logger.Info("projection worker started", "interval", interval.String())
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			projectTick(ctx, logger, g, conn)
+		}
+	}
+}
+
+// projectTick runs one entities+edges pass. Logging is content-free: counts
+// and errors only. Ticks aborted by shutdown log nothing — cancellation is
+// not an operational problem.
+func projectTick(ctx context.Context, logger *slog.Logger, g *graph.Store, conn driver.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("projection tick panicked; recovered until next tick", "panic", r)
+		}
+	}()
+
+	nEnt, err := graph.ProjectEntities(ctx, g, conn, 0)
+	switch {
+	case err != nil && ctx.Err() != nil: // shutdown raced the tick
+		return
+	case err != nil:
+		logger.Error("entity projection failed; will retry next tick",
+			"projected_before_err", nEnt, "err", err)
+	case nEnt > 0:
+		logger.Info("entities projected", "count", nEnt)
+	}
+
+	nEdge, err := graph.ProjectEdges(ctx, g, conn, 0)
+	switch {
+	case err != nil && ctx.Err() != nil: // shutdown raced the tick
+	case err != nil:
+		logger.Error("edge projection failed; will retry next tick",
+			"processed_before_err", nEdge, "err", err)
+	case nEdge > 0:
+		logger.Info("edges projected", "count", nEdge)
+	}
+}
+
+// runExtractionWorker turns uncovered observations into proposed facts via
+// the chat model (design §10). The service loop already recovers panics per
+// tick and validates its own arguments; this outer recover covers everything
+// around the ticks so no panic can kill the goroutine silently.
+func runExtractionWorker(ctx context.Context, logger *slog.Logger, svc *memory.Service, chat extract.ChatClient, model string, interval time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("extraction worker panicked", "panic", r)
+		}
+	}()
+	logger.Info("extraction worker started",
+		"interval", interval.String(), "batch", extractionBatch, "model", model)
+	svc.RunExtractionLoop(ctx, chat, interval, extractionBatch)
 }
