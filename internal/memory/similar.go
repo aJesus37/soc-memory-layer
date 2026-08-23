@@ -42,6 +42,7 @@ type SearchHit struct {
 	Ts        time.Time
 	Kind      string
 	Excerpt   string   // same rune-safe truncation as enrich views
+	EntityIDs []string // entities the observation references (stable across retries)
 	Score     float64  // RRF score
 	MatchedBy []string // sorted subset of {"vec","txt"}
 }
@@ -101,21 +102,25 @@ var (
 // inventing an arbitrary total order. The scope aggregate is aliased
 // obs_scope (NOT scope): ClickHouse substitutes aliases globally, so a
 // bare `scope` in this CTE's WHERE clause would resolve to the aggregate.
+// NOTE: verb order below is [terms][rrfK][maxExcerptRunes] because the
+// scores CTE precedes the projection in the template.
 func fusionSQL(terms []string) string {
 	return fmt.Sprintf(
 		"fused AS ("+
 			"SELECT obs_id, src, min(rnk) AS rnk FROM (%s) "+
 			"GROUP BY obs_id, src), "+
 			"obs AS ("+
-			"SELECT obs_id, min(scope) AS obs_scope, min(ts) AS ts, any(kind) AS kind, min(content) AS content "+
+			"SELECT obs_id, min(scope) AS obs_scope, min(ts) AS ts, any(kind) AS kind, min(content) AS content, any(entity_refs) AS refs "+
 			"FROM mem.observations WHERE scope = ? AND obs_id IN (SELECT obs_id FROM fused) "+
-			"GROUP BY obs_id) "+
+			"GROUP BY obs_id), "+
+			"scores AS ("+
+			"SELECT f.obs_id, sum(1.0 / (%d + f.rnk)) AS score, groupArray(f.src) AS matched_by "+
+			"FROM fused f GROUP BY f.obs_id) "+
 			"SELECT o.obs_id, o.obs_scope, o.ts, o.kind, substringUTF8(o.content, 1, %d) AS excerpt, "+
-			"sum(1.0 / (%d + f.rnk)) AS score, groupArray(f.src) AS matched_by "+
-			"FROM fused f JOIN obs o ON o.obs_id = f.obs_id "+
-			"GROUP BY o.obs_id, o.obs_scope, o.ts, o.kind, excerpt "+
-			"ORDER BY score DESC, o.obs_id ASC LIMIT ?",
-		strings.Join(terms, " UNION ALL "), maxExcerptRunes, rrfK)
+			"o.refs AS entity_ids, s.score, s.matched_by "+
+			"FROM scores s JOIN obs o ON o.obs_id = s.obs_id "+
+			"ORDER BY s.score DESC, o.obs_id ASC LIMIT ?",
+		strings.Join(terms, " UNION ALL "), rrfK, maxExcerptRunes)
 }
 
 // buildSimilar assembles the statement and its arguments for whichever
@@ -207,11 +212,17 @@ func (s *Service) Similar(ctx context.Context, scope, query string, k int) ([]Se
 			h       SearchHit
 			obsID   uuid.UUID
 			matched []string
+			refs    []uuid.UUID
 		)
-		if err := rows.Scan(&obsID, &h.Scope, &h.Ts, &h.Kind, &h.Excerpt, &h.Score, &matched); err != nil {
+		if err := rows.Scan(&obsID, &h.Scope, &h.Ts, &h.Kind, &h.Excerpt, &refs, &h.Score, &matched); err != nil {
 			return nil, fmt.Errorf("memory: similar scan hit scope %q: %w", scopedScope, err)
 		}
 		h.ObsID = obsID.String()
+		for _, r := range refs {
+			if r != uuid.Nil {
+				h.EntityIDs = append(h.EntityIDs, r.String())
+			}
+		}
 		sort.Strings(matched) // deterministic ["txt","vec"] shape regardless of union order
 		h.MatchedBy = matched
 		hits = append(hits, h)

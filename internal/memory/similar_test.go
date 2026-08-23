@@ -475,7 +475,8 @@ func TestSimilarSQLAssembly(t *testing.T) {
 		}
 		for _, want := range []string{
 			"GROUP BY obs_id, src", "min(rnk)", "groupArray(f.src)",
-			"ORDER BY score DESC, o.obs_id ASC",
+			"ORDER BY s.score DESC, o.obs_id ASC",
+			"sum(1.0 / (60 + f.rnk))", // pins rrfK wiring: score must use 60, not excerpt length
 		} {
 			if !strings.Contains(sqlText, want) {
 				t.Errorf("%s: shared fusion suffix lost %q", tc.name, want)

@@ -1,0 +1,11 @@
+# Smoke eval: questions against seeds/smoke.jsonl + api-test data.
+# Entity keys must exist in the seeded scope. Run: go run ./cmd/memeval
+name: smoke
+scope: seed-demo
+queries:
+  - q: "what did we conclude about the beaconing infrastructure?"
+    must_reference_entities: ["203.0.113.7"]
+    k: 10
+  - q: "duplicate alert closure"
+    must_reference_entities: []
+    k: 10
