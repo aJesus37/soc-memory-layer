@@ -1,0 +1,18 @@
+-- Migration 003: mem.edges gains updated_at, the keyset-pagination cursor
+-- for edge projection (same pattern as mem.entities.updated_at).
+--
+-- WHY edges need their own timestamp: an edge row's lifecycle is INSERT at
+-- fact activation plus MUTATION-close when a supersede wave or retraction
+-- sets valid_to (see closeEdgesForPredicate / closeEdgesByFromFact). Keyset
+-- pagination on a timestamp can only see rows it has not seen yet; a closed
+-- row's own timestamp never moves on its own, so the mutation would be
+-- invisible to a projector whose cursor already passed the insert. Writers
+-- therefore bump updated_at alongside valid_to (Task 7), making every
+-- closure a fresh version in the projection order.
+--
+-- NO BACKFILL by design: the column is added with DEFAULT now64(3) and no
+-- MATERIALIZE mutation, so Phase-1-era dev rows are not stamped. Dev volume
+-- only — such rows either read as the default or vanish with local test
+-- data; production rollouts start empty.
+-- Idempotent per convention (retry-safe migrations).
+ALTER TABLE mem.edges ADD COLUMN IF NOT EXISTS updated_at DateTime64(3) DEFAULT now64(3);

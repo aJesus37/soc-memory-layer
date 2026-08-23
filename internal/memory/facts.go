@@ -698,19 +698,24 @@ func (s *Service) closeFactByID(ctx context.Context, factID uuid.UUID) error {
 // AFTER the fact row committed (an edge must never outlive-orphan its
 // fact) and treat an error as best-effort degradation, since the fact
 // itself already stands.
+//
+// updated_at is written explicitly (not left to its DEFAULT): it feeds the
+// edge projector's keyset cursor, which can only ever see rows whose own
+// timestamp sorts past the watermark, so every row must carry a real
+// insert-time stamp from birth.
 func (s *Service) insertEdgeIfObject(ctx context.Context, f factArgs, validFrom time.Time) error {
 	if f.objectID == nil {
 		return nil
 	}
 	b, err := s.conn.PrepareBatch(ctx,
 		"INSERT INTO mem.edges "+
-			"(edge_id, scope, src_id, dst_id, relation, from_fact, valid_from, valid_to)")
+			"(edge_id, scope, src_id, dst_id, relation, from_fact, valid_from, valid_to, updated_at)")
 	if err != nil {
 		return fmt.Errorf("memory: stage edge insert: %w", err)
 	}
 	if err := b.Append(
 		uuid.New(), f.scope, f.subjectUUID, *f.objectID, f.predicate, f.factUUID,
-		validFrom, farFuture,
+		validFrom, farFuture, time.Now().UTC(),
 	); err != nil {
 		return fmt.Errorf("memory: append edge row: %w", err)
 	}
@@ -728,13 +733,19 @@ func (s *Service) insertEdgeIfObject(ctx context.Context, f factArgs, validFrom 
 // No pre-count (nothing to report into the audit summary) and
 // mutations_sync = 1 like every mutation here, so this helper's own later
 // edge insert can never be closed by its own wave.
+//
+// The closure also MOVES updated_at: the edge projector pages on
+// (updated_at, edge_id), so a closed row whose timestamp stayed at its
+// insert value would be invisible to a cursor already past it — closures
+// must surface as fresh versions in the projection order (migration 003).
 func (s *Service) closeEdgesForPredicate(ctx context.Context, scope string, src uuid.UUID, relation string) error {
+	now := time.Now().UTC()
 	err := s.conn.Exec(ctx,
-		"ALTER TABLE mem.edges UPDATE valid_to = ? "+
+		"ALTER TABLE mem.edges UPDATE valid_to = ?, updated_at = ? "+
 			"WHERE scope = ? AND src_id = ? AND relation = ? "+
 			"AND valid_to > now64(3) "+
 			"SETTINGS mutations_sync = 1",
-		time.Now().UTC(), scope, src, relation,
+		now, chMsTimestamp(now), scope, src, relation,
 	)
 	if err != nil {
 		return fmt.Errorf("memory: supersede open edges (scope=%s): %w", scope, err)
@@ -746,18 +757,32 @@ func (s *Service) closeEdgesForPredicate(ctx context.Context, scope string, src 
 // the edge-space twin of closeFactByID, scoped to from_fact alone so a
 // retract can never disturb edges belonging to sibling facts that merely
 // share (scope, subject_id, predicate). Used by RetractFact after its
-// replacement committed; mutations_sync = 1 as everywhere.
+// replacement committed; mutations_sync = 1 as everywhere. Like
+// closeEdgesForPredicate it bumps updated_at so the closure becomes visible
+// to the edge projector's keyset cursor.
 func (s *Service) closeEdgesByFromFact(ctx context.Context, fromFact uuid.UUID) error {
+	now := time.Now().UTC()
 	err := s.conn.Exec(ctx,
-		"ALTER TABLE mem.edges UPDATE valid_to = ? "+
+		"ALTER TABLE mem.edges UPDATE valid_to = ?, updated_at = ? "+
 			"WHERE from_fact = ? AND valid_to > now64(3) "+
 			"SETTINGS mutations_sync = 1",
-		time.Now().UTC(), fromFact,
+		now, chMsTimestamp(now), fromFact,
 	)
 	if err != nil {
 		return fmt.Errorf("memory: close edges of fact %s: %w", fromFact, err)
 	}
 	return nil
+}
+
+// chMsTimestamp renders t for binding against a DateTime64(3) column in
+// query-text statements. clickhouse-go v2 renders bare time.Time bind
+// parameters at SECOND precision in Exec/Query paths (PrepareBatch.Append
+// uses the native binary encoder and is unaffected), so an updated_at set
+// through ALTER UPDATE silently lands on .000 unless formatted explicitly —
+// which would hide closures from the projector's millisecond cursor.
+// Mirrors graph.formatCHTimestamp; keep the two in sync.
+func chMsTimestamp(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05.000")
 }
 
 func (s *Service) insertFact(ctx context.Context, f factArgs, status Status, conf float32, validFrom time.Time) error {
