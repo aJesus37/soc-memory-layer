@@ -23,6 +23,13 @@ const maxTimelineLimit = 500
 // hundreds of observations, and preferable to an unbounded IN list.
 const timelineSubjectsCap = 200
 
+// siblingEntitiesCap bounds the org-wide sibling set: how many entity rows
+// sharing (entity_type, key) may feed the by-entity IN lists, mirroring
+// timelineSubjectsCap. A key seen in more scopes than this silently drops
+// the overflow's rows from the timeline — preferable to an unbounded IN
+// list at SOC-scale key fanout.
+const siblingEntitiesCap = 200
+
 // Event is one reconstructed moment on a Timeline. Facts have no
 // ts-of-event other than valid_from, so per the DECISION they surface with
 // Ts=valid_from, Kind="fact:<predicate>" and ActorID=written_by — an honest
@@ -233,7 +240,8 @@ func (s *Service) timelineCaseSubjects(ctx context.Context, scope string, caseID
 // anchor's own (type, key), then matches every row sharing the pair; an
 // anchor that exists in no scope therefore yields an empty (not nil-error)
 // result. FINAL collapses ReplacingMergeTree versions to one row per
-// (scope, type, key); ids are sorted so bind order is deterministic.
+// (scope, type, key); ids are sorted so bind order is deterministic, then
+// capped at siblingEntitiesCap.
 func (s *Service) siblingEntityIDs(ctx context.Context, anchor uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.conn.Query(ctx,
 		"SELECT entity_id FROM mem.entities FINAL "+
@@ -255,7 +263,12 @@ func (s *Service) siblingEntityIDs(ctx context.Context, anchor uuid.UUID) ([]uui
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("memory: timeline iterate siblings %s: %w", anchor, err)
 	}
+	// Deterministic cap order: pages must agree on WHICH siblings survive
+	// truncation, so sort by canonical string form before slicing.
 	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	if len(ids) > siblingEntitiesCap {
+		ids = ids[:siblingEntitiesCap]
+	}
 	return ids, nil
 }
 

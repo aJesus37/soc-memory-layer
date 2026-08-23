@@ -287,8 +287,9 @@ func (s *Service) Similar(ctx context.Context, scope, query string, k int) ([]Se
 	}
 
 	// Hydration: one winner row per id. Physical retry duplicates collapse
-	// to earliest ts then lexicographically smallest content (the same rule
-	// the Phase-1 SQL applied); kind/refs ride along from that winner.
+	// to earliest ts then lexicographically smallest content (a stricter
+	// deterministic variant of the Phase-1 folds; differs only for
+	// divergent-content retries); kind/refs ride along from that winner.
 	args := make([]any, 0, len(ids)+1)
 	args = append(args, scopedScope)
 	for _, id := range ids {

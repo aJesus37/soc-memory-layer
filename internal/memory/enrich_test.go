@@ -57,7 +57,11 @@ func TestEnrich(t *testing.T) {
 	ctx := context.Background()
 	s := testService(t, conn)
 	scope := itestScope()
-	subj := mustResolveEntity(t, conn, scope, "bad.example.com")
+	// Unique per run: sibling/fact/observation resolution is org-wide, so a
+	// fixed key would drag every prior run's rows into this test's windows
+	// (same discipline as the timeline tests).
+	domain := fmt.Sprintf("enrich-%x.example.com", time.Now().UnixNano())
+	subj := mustResolveEntity(t, conn, scope, domain)
 
 	// One active human fact...
 	f1, err := s.AssertFact(ctx, FactInput{
@@ -117,7 +121,7 @@ func TestEnrich(t *testing.T) {
 			ActorType: "agent",
 			ActorID:   "sensor-7",
 			Ts:        time.Now().Add(-age),
-			Content:   fmt.Sprintf("beacon %d seen toward bad.example.com", i),
+			Content:   fmt.Sprintf("beacon %d seen toward %s", i, domain),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -148,14 +152,14 @@ func TestEnrich(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := s.Enrich(ctx, scope, "bad.example.com", entity.IocDomain)
+	res, err := s.Enrich(ctx, scope, domain, entity.IocDomain)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !res.Found {
 		t.Fatal("should be found")
 	}
-	if res.Entity.EntityID != subj.EntityID || res.Entity.Key != "bad.example.com" ||
+	if res.Entity.EntityID != subj.EntityID || res.Entity.Key != domain ||
 		res.Entity.EntityType != entity.IocDomain || res.Entity.Scope != scope {
 		t.Fatalf("entity projection wrong: %+v", res.Entity)
 	}
@@ -223,7 +227,7 @@ func TestEnrich(t *testing.T) {
 	// the same key enriched from a DIFFERENT scope still finds the entity —
 	// org-wide by default — with attribution labeling every shared row.
 	other := itestScope()
-	iso, err := s.Enrich(ctx, other, "bad.example.com", entity.IocDomain)
+	iso, err := s.Enrich(ctx, other, domain, entity.IocDomain)
 	if err != nil {
 		t.Fatalf("foreign-scope lookup must not error: %v", err)
 	}
@@ -269,12 +273,15 @@ func TestEnrichNeighbors(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
 	s := testService(t, conn)
+	// Unique per run: the neighbor query is org-wide (no scope filter), so
+	// fixed keys would resurface every prior run's edges here.
+	run := fmt.Sprintf("%x", time.Now().UnixNano())
 
 	t.Run("both directions, deduped, sorted", func(t *testing.T) {
 		scope := itestScope()
-		subj := mustResolveEntity(t, conn, scope, "hub.example.com")
-		a := mustResolveEntity(t, conn, scope, "peer-a.example.com")
-		b := mustResolveEntity(t, conn, scope, "peer-b.example.com")
+		subj := mustResolveEntity(t, conn, scope, "hub-"+run+".example.com")
+		a := mustResolveEntity(t, conn, scope, "peer-a-"+run+".example.com")
+		b := mustResolveEntity(t, conn, scope, "peer-b-"+run+".example.com")
 
 		insertEdge(t, ctx, conn, scope, subj.EntityID, a.EntityID, "communicates_with")
 		insertEdge(t, ctx, conn, scope, b.EntityID, subj.EntityID, "resolved_to")
@@ -282,7 +289,7 @@ func TestEnrichNeighbors(t *testing.T) {
 		// must collapse on read into one Neighbor.
 		insertEdge(t, ctx, conn, scope, subj.EntityID, a.EntityID, "communicates_with")
 
-		res, err := s.Enrich(ctx, scope, "hub.example.com", entity.IocDomain)
+		res, err := s.Enrich(ctx, scope, "hub-"+run+".example.com", entity.IocDomain)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -315,7 +322,7 @@ func TestEnrichNeighbors(t *testing.T) {
 
 	t.Run("capped at 50 deterministically", func(t *testing.T) {
 		scope := itestScope()
-		hub := mustResolveEntity(t, conn, scope, "fanout.example.com")
+		hub := mustResolveEntity(t, conn, scope, "fanout-"+run+".example.com")
 
 		// 60 out-edges to fabricated peer ids (the neighbor query reads
 		// mem.edges only; peer entity rows are irrelevant to the cap).
@@ -340,7 +347,7 @@ func TestEnrichNeighbors(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		res, err := s.Enrich(ctx, scope, "fanout.example.com", entity.IocDomain)
+		res, err := s.Enrich(ctx, scope, "fanout-"+run+".example.com", entity.IocDomain)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -369,8 +376,8 @@ func TestEnrichNeighbors(t *testing.T) {
 	// cleanup pass, is what hides it.
 	t.Run("closed edges invisible to neighbors", func(t *testing.T) {
 		scope := itestScope()
-		hub := mustResolveEntity(t, conn, scope, "closure-hub.example.com")
-		peer := mustResolveEntity(t, conn, scope, "closure-peer.example.com")
+		hub := mustResolveEntity(t, conn, scope, "closure-hub-"+run+".example.com")
+		peer := mustResolveEntity(t, conn, scope, "closure-peer-"+run+".example.com")
 
 		f, err := s.AssertFact(ctx, FactInput{
 			Scope:       scope,
@@ -389,7 +396,7 @@ func TestEnrichNeighbors(t *testing.T) {
 			t.Fatalf("fact = %s, want active", f.Status)
 		}
 
-		res, err := s.Enrich(ctx, scope, "closure-hub.example.com", entity.IocDomain)
+		res, err := s.Enrich(ctx, scope, "closure-hub-"+run+".example.com", entity.IocDomain)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -402,7 +409,7 @@ func TestEnrichNeighbors(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		res, err = s.Enrich(ctx, scope, "closure-hub.example.com", entity.IocDomain)
+		res, err = s.Enrich(ctx, scope, "closure-hub-"+run+".example.com", entity.IocDomain)
 		if err != nil {
 			t.Fatal(err)
 		}
