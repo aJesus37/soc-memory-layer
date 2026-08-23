@@ -106,6 +106,13 @@ func main() {
 
 	stdio := server.NewStdioServer(srv)
 	stdio.SetErrorLogger(log.New(os.Stderr, "memmcp: ", log.LstdFlags))
+	// Handlers take identity from the request context (see mcpserver
+	// package doc); stdio's single env-loaded identity is injected here.
+	// The context func runs once per connection — correct, because this
+	// transport has exactly one identity by construction.
+	stdio.SetContextFunc(func(ctx context.Context) context.Context {
+		return mcpserver.WithIdentity(ctx, id)
+	})
 
 	// Serve until the client closes stdin or SIGINT/SIGTERM cancels ctx.
 	// Listen returns ctx.Err() after cancellation and nil on clean EOF.
