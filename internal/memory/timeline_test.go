@@ -14,14 +14,18 @@ import (
 // chronological order, at controlled ts) with one asserted fact and checks
 // the union: 4 events, strictly newest-first, the fact rendered with
 // Kind="fact:<predicate>" at its valid_from, observations carrying their
-// excerpts. Also pins that RecordObservation honors Input.Ts — if it forced
-// now(), the strict ordering below would collapse and fail.
+// excerpts and every event labeled OriginScope=<own scope>. Also pins that
+// RecordObservation honors Input.Ts — if it forced now(), the strict
+// ordering below would collapse and fail. The subject domain is unique per
+// run because sibling resolution is org-wide: a fixed key would drag every
+// prior run's entity (and its facts) into the timeline.
 func TestTimelineByEntity(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
 	s := testService(t, conn)
 	scope := itestScope()
-	subj := mustResolveEntity(t, conn, scope, "timeline.target.example.com")
+	domain := fmt.Sprintf("timeline-%x.example.com", time.Now().UnixNano())
+	subj := mustResolveEntity(t, conn, scope, domain)
 
 	type seed struct {
 		text string
@@ -42,7 +46,7 @@ func TestTimelineByEntity(t *testing.T) {
 			ActorType: "agent",
 			ActorID:   "sensor-7",
 			Ts:        seededAt.Add(-sd.age),
-			Content:   sd.text + " involving timeline.target.example.com",
+			Content:   sd.text + " involving " + domain,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -81,6 +85,9 @@ func TestTimelineByEntity(t *testing.T) {
 	if fe.Source != "fact" || fe.Kind != "fact:verdict_malicious" || fe.ActorID != "analyst-j" {
 		t.Fatalf("fact event wrong: %+v", fe)
 	}
+	if fe.OriginScope != scope {
+		t.Errorf("fact OriginScope = %q, want %q", fe.OriginScope, scope)
+	}
 	if !strings.Contains(fe.Text, "verdict_malicious") || !strings.Contains(fe.Text, "c2") {
 		t.Fatalf("fact Text %q must contain predicate and object value", fe.Text)
 	}
@@ -105,7 +112,10 @@ func TestTimelineByEntity(t *testing.T) {
 		if e.ActorID != "sensor-7" {
 			t.Errorf("events[%d].ActorID = %q, want sensor-7", i+1, e.ActorID)
 		}
-		if excerpt := w.text + " involving timeline.target.example.com"; e.Text != excerpt {
+		if e.OriginScope != scope {
+			t.Errorf("events[%d].OriginScope = %q, want %q", i+1, e.OriginScope, scope)
+		}
+		if excerpt := w.text + " involving " + domain; e.Text != excerpt {
 			t.Errorf("events[%d].Text = %q, want %q", i+1, e.Text, excerpt)
 		}
 		wantTs := seededAt.Add(-w.age)
@@ -235,7 +245,10 @@ func TestTimelineByCase(t *testing.T) {
 		t.Fatalf("unknown case events = %+v, want empty", empty)
 	}
 
-	// Scope isolation: the same case id viewed from another scope is empty.
+	// Scope isolation (still valid, now a pinned contract): the by-case
+	// path is strictly scope-local even under the shared-knowledge model —
+	// cases are team artifacts, so the same case id viewed from another
+	// scope is empty.
 	iso, err := s.Timeline(ctx, itestScope(), caseID, "", 50, 0)
 	if err != nil {
 		t.Fatalf("foreign-scope lookup must not error: %v", err)
@@ -253,7 +266,10 @@ func TestTimelinePagination(t *testing.T) {
 	ctx := context.Background()
 	s := testService(t, conn)
 	scope := itestScope()
-	subj := mustResolveEntity(t, conn, scope, "pagination.target.example.com")
+	// Unique per run: sibling resolution is org-wide, so a fixed key would
+	// pull prior runs' observations into the reference page.
+	domain := fmt.Sprintf("pagination-%x.example.com", time.Now().UnixNano())
+	subj := mustResolveEntity(t, conn, scope, domain)
 
 	seededAt := time.Now().UTC()
 	for i := 1; i <= 5; i++ {
@@ -263,7 +279,7 @@ func TestTimelinePagination(t *testing.T) {
 			ActorType: "agent",
 			ActorID:   "sensor-7",
 			Ts:        seededAt.Add(-time.Duration(i) * time.Hour),
-			Content:   fmt.Sprintf("pagination obs %d on pagination.target.example.com", i),
+			Content:   fmt.Sprintf("pagination obs %d on %s", i, domain),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -378,7 +394,10 @@ func TestTimelineExcludesRetractedFacts(t *testing.T) {
 	ctx := context.Background()
 	s := testService(t, conn)
 	scope := itestScope()
-	subj := mustResolveEntity(t, conn, scope, "retracted.timeline.example.com")
+	// Unique per run: org-wide sibling resolution would otherwise surface
+	// prior runs' facts for the same key.
+	domain := fmt.Sprintf("retracted-%x.example.com", time.Now().UnixNano())
+	subj := mustResolveEntity(t, conn, scope, domain)
 
 	if _, err := s.AssertFact(ctx, FactInput{
 		Scope:       scope,
@@ -423,7 +442,10 @@ func TestTimelineShowsSupersededPriors(t *testing.T) {
 	ctx := context.Background()
 	s := testService(t, conn)
 	scope := itestScope()
-	subj := mustResolveEntity(t, conn, scope, "superseded.timeline.example.com")
+	// Unique per run: org-wide sibling resolution would otherwise surface
+	// prior runs' assertion history for the same key.
+	domain := fmt.Sprintf("superseded-%x.example.com", time.Now().UnixNano())
+	subj := mustResolveEntity(t, conn, scope, domain)
 
 	f1, err := s.AssertFact(ctx, FactInput{
 		Scope:       scope,
@@ -471,5 +493,151 @@ func TestTimelineShowsSupersededPriors(t *testing.T) {
 		if got[i] != w {
 			t.Errorf("event %d: got %q want %q", i, got[i], w)
 		}
+	}
+}
+
+// TestTimelineEntityOrgFacts pins the org-wide by-entity path: team-a
+// asserts an ordinary (visibility="" → 'org') fact on a unique domain and
+// records an internal observation for it; team-b — with no local entity for
+// that key — walks TEAM-A'S ENTITY ID and must see the fact event plus the
+// internal observation, each labeled OriginScope=team-a. A restricted
+// sibling observation stays home, and an anchor id that exists nowhere
+// yields an empty timeline without error.
+func TestTimelineEntityOrgFacts(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	teamA := itestScope()
+	teamB := itestScope()
+	domain := fmt.Sprintf("org-timeline-%x.example.net", time.Now().UnixNano())
+
+	subjA := mustResolveEntity(t, conn, teamA, domain)
+	if _, err := s.AssertFact(ctx, FactInput{
+		Scope:       teamA,
+		SubjectID:   subjA.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "c2",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordObservation(ctx, Input{
+		Scope:     teamA,
+		Kind:      "hunt_finding",
+		ActorType: "human",
+		ActorID:   "analyst-a",
+		Content:   domain + " beaconed every sixty seconds",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordObservation(ctx, Input{
+		Scope:           teamA,
+		Kind:            "investigation_note",
+		ActorType:       "human",
+		ActorID:         "analyst-a",
+		Confidentiality: "restricted",
+		Content:         domain + " under restricted covert handling",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Timeline(ctx, teamB, "", subjA.EntityID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nObs, nFact int
+	for _, e := range events {
+		if e.OriginScope != teamA {
+			t.Errorf("event %+v origin = %q, want %q", e, e.OriginScope, teamA)
+		}
+		switch e.Source {
+		case "observation":
+			nObs++
+			if !strings.Contains(e.Text, "beaconed") {
+				t.Errorf("restricted observation leaked cross-scope: %+v", e)
+			}
+		case "fact":
+			nFact++
+			if e.Kind != "fact:verdict_malicious" || !strings.Contains(e.Text, "c2") {
+				t.Errorf("fact event wrong: %+v", e)
+			}
+		default:
+			t.Errorf("event Source = %q, want observation|fact", e.Source)
+		}
+	}
+	if nObs != 1 || nFact != 1 {
+		t.Fatalf("team-b timeline = %d observations / %d facts (%+v), want 1 / 1", nObs, nFact, events)
+	}
+
+	// The home team sees both observations (restricted included), labeled
+	// with itself.
+	eventsA, err := s.Timeline(ctx, teamA, "", subjA.EntityID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obsA int
+	for _, e := range eventsA {
+		if e.Source == "observation" {
+			obsA++
+			if e.OriginScope != teamA {
+				t.Errorf("home event origin = %q, want %q", e.OriginScope, teamA)
+			}
+		}
+	}
+	if obsA != 2 {
+		t.Fatalf("home-team observations = %d (%+v), want both", obsA, eventsA)
+	}
+
+	// An anchor that exists in no scope: honest miss, no error.
+	missing, err := s.Timeline(ctx, teamB, "", uuid.NewString(), 50, 0)
+	if err != nil {
+		t.Fatalf("unknown anchor must not error: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("unknown anchor events = %+v, want empty", missing)
+	}
+}
+
+// TestTimelineCaseStaysLocal is the regression guard for the deliberate
+// asymmetry in the shared-knowledge model: the by-case path remains
+// strictly scope-local. Team-a's case (its observations and everything the
+// bridge reaches) must be invisible to team-b, while team-a sees its own
+// events labeled with itself.
+func TestTimelineCaseStaysLocal(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	teamA := itestScope()
+	teamB := itestScope()
+
+	caseID := uuid.NewString()
+	domain := fmt.Sprintf("case-local-%x.example.net", time.Now().UnixNano())
+	if _, err := s.RecordObservation(ctx, Input{
+		Scope:     teamA,
+		Kind:      "triage_decision",
+		ActorType: "human",
+		ActorID:   "analyst-a",
+		CaseID:    caseID,
+		Content:   "escalating " + domain + " into the case",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	foreign, err := s.Timeline(ctx, teamB, caseID, "", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreign) != 0 {
+		t.Fatalf("by-case path leaked across teams: %+v", foreign)
+	}
+
+	own, err := s.Timeline(ctx, teamA, caseID, "", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(own) != 1 || own[0].Source != "observation" || own[0].OriginScope != teamA {
+		t.Fatalf("home-team case timeline wrong: %+v", own)
 	}
 }
