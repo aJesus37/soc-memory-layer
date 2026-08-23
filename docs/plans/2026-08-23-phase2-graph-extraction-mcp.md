@@ -134,7 +134,7 @@ Flags: `-batch 500`. Drops Dgraph DATA (keep schema), resets watermarks to 0, lo
 
 **Files:** Migration `004_extract_log.sql`; Modify `cmd/memserved/main.go`; config additions `MEM_EXTRACT_ENABLED`(default false), `MEM_EXTRACT_MODEL`(default qwen/qwen3-8b), `MEM_EXTRACT_INTERVAL_SECONDS`(30), `MEM_PROJECT_INTERVAL_SECONDS`(5)
 
-Workers as goroutines with context cancel on shutdown; panic-recover per tick; log lag/counters (no content). Verify live: start service, POST observation stating a fact, wait interval, enrich shows proposed fact. Commit: `feat: wire projection + extraction workers`
+Workers as goroutines with context cancel on shutdown; panic-recover per tick; log lag/counters (no content). Verify live: start service, POST observation stating a fact, wait interval, enrich shows proposed fact. Commit: `feat: wire projection + extraction workers` (graph-store wiring in main.go landed early with Task 9, controller-approved)
 
 ### Task 13: MCP stdio server
 

@@ -412,24 +412,27 @@ func sortPaths(paths []Path) {
 // documented CONTRACT, not an accident: CH joins beyond one hop are
 // quadratic and unbounded, while the graph engine exists precisely to make
 // multi-hop cheap. A requested depth ≥2 therefore still returns a 1-hop
-// result set.
+// result set. The cap is deterministic: distinct (nid, relation) pairs are
+// ordered newest-edge-first with edge_id breaking ties, so a saturated
+// LIMIT returns a stable subset.
 func (s *Service) traverseFallback(ctx context.Context, scope string, start entity.Entity, relation string) ([]Path, error) {
 	startU, err := uuid.Parse(start.EntityID)
 	if err != nil {
 		return nil, fmt.Errorf("memory: traverse fallback entity id %q: %w", start.EntityID, err)
 	}
-	q := "SELECT DISTINCT nid, relation FROM (" +
-		"SELECT dst_id AS nid, relation FROM mem.edges " +
+	q := "SELECT nid, relation FROM (" +
+		"SELECT dst_id AS nid, relation, valid_from AS ts, edge_id AS ek FROM mem.edges " +
 		"WHERE scope = ? AND src_id = ? AND valid_to > now64(3) " +
 		"UNION ALL " +
-		"SELECT src_id AS nid, relation FROM mem.edges " +
+		"SELECT src_id AS nid, relation, valid_from AS ts, edge_id AS ek FROM mem.edges " +
 		"WHERE scope = ? AND dst_id = ? AND valid_to > now64(3)"
 	args := []any{scope, startU, scope, startU}
 	if relation != "" {
 		q += " WHERE relation = ?"
 		args = append(args, relation)
 	}
-	q += fmt.Sprintf(") LIMIT %d", maxTraversePaths)
+	q += ") GROUP BY nid, relation " +
+		fmt.Sprintf("ORDER BY max(ts) DESC, min(ek) ASC LIMIT %d", maxTraversePaths)
 
 	rows, err := s.conn.Query(ctx, q, args...)
 	if err != nil {

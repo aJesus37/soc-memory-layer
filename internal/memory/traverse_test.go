@@ -18,10 +18,10 @@ import (
 // itestTwoStores wires a graph-mode service over BOTH stores, reset fresh:
 // Dgraph data dropped (schema kept), mem.entities/mem.edges wiped and both
 // projection watermarks zeroed — the same contract as the graph package's
-// itestBoth, so seeded rows project deterministically. The suite runs
-// package binaries serially (make itest -p 1) and this file sorts last
-// alphabetically within the package, so the wipe cannot disturb earlier
-// tests' assertions.
+// itestBoth, so seeded rows project deterministically. The wipes stay safe
+// under sequential test order: every file registered before this one has
+// finished by then, and trust_test.go (registered after) touches none of
+// the wiped tables.
 func itestTwoStores(t *testing.T) (*Service, *graph.Store, driver.Conn) {
 	t.Helper()
 	dgAddr := os.Getenv("MEM_TEST_DGRAPH_ADDR")
@@ -347,17 +347,17 @@ func TestTraverseValidation(t *testing.T) {
 		scope, key, relation string
 		hops                 int
 	}{
-		"blank scope":     {scope: "   ", key: "a.example.com", hops: 1},
-		"empty key":       {scope: scope, key: "", hops: 1},
-		"blank key":       {scope: scope, key: "   ", hops: 1},
-		"uppercase rel":   {scope: scope, key: "a.example.com", relation: "Resolved_To", hops: 1},
-		"leading digit":   {scope: scope, key: "a.example.com", relation: "1abc", hops: 1},
-		"hyphen rel":      {scope: scope, key: "a.example.com", relation: "has-hyphen", hops: 1},
-		"too long rel":    {scope: scope, key: "a.example.com", relation: "a" + strings.Repeat("b", 41), hops: 1},
-		"hops zero":       {scope: scope, key: "a.example.com", hops: 0},
-		"hops four":       {scope: scope, key: "a.example.com", hops: 4},
-		"hops negative":   {scope: scope, key: "a.example.com", hops: -2},
-		"whitespace hops": {scope: scope, key: "a.example.com", hops: 99},
+		"blank scope":    {scope: "   ", key: "a.example.com", hops: 1},
+		"empty key":      {scope: scope, key: "", hops: 1},
+		"blank key":      {scope: scope, key: "   ", hops: 1},
+		"uppercase rel":  {scope: scope, key: "a.example.com", relation: "Resolved_To", hops: 1},
+		"leading digit":  {scope: scope, key: "a.example.com", relation: "1abc", hops: 1},
+		"hyphen rel":     {scope: scope, key: "a.example.com", relation: "has-hyphen", hops: 1},
+		"too long rel":   {scope: scope, key: "a.example.com", relation: "a" + strings.Repeat("b", 41), hops: 1},
+		"hops zero":      {scope: scope, key: "a.example.com", hops: 0},
+		"hops four":      {scope: scope, key: "a.example.com", hops: 4},
+		"hops negative":  {scope: scope, key: "a.example.com", hops: -2},
+		"hops too large": {scope: scope, key: "a.example.com", hops: 99},
 	}
 	for name, tc := range cases {
 		_, err := svc.Traverse(ctx, tc.scope, tc.key, entity.IocDomain, tc.relation, tc.hops)
