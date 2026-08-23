@@ -28,7 +28,6 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 
 type createObservationReq struct {
 	Kind            string `json:"kind"`
-	OnBehalfOf      string `json:"on_behalf_of,omitempty"`
 	CaseID          string `json:"case_id,omitempty"`
 	ClientEventID   string `json:"client_event_id,omitempty"`
 	Confidentiality string `json:"confidentiality,omitempty"`
@@ -72,7 +71,7 @@ func (s *Server) handleCreateObservation(w http.ResponseWriter, r *http.Request)
 		Kind:            req.Kind,
 		ActorType:       ctxString(r, ctxActorType),
 		ActorID:         ctxString(r, ctxActorID),
-		OnBehalfOf:      req.OnBehalfOf,
+		OnBehalfOf:      ctxString(r, ctxOnBehalfOf), // header only; never the body
 		CaseID:          req.CaseID,
 		ClientEventID:   req.ClientEventID,
 		Confidentiality: req.Confidentiality,

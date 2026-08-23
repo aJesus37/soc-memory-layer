@@ -314,6 +314,54 @@ func caseIDFor(t *testing.T) string {
 	return fmt.Sprintf("00000000-0000-0000-0000-%012d", n)
 }
 
+// TestOnBehalfOfHeaderOnly pins delegation identity to the X-On-Behalf-Of
+// header only. A body-borne on_behalf_of is an unknown field now and must be
+// rejected loudly (same treatment as body-borne scope), while the header
+// value is what actually persists.
+func TestOnBehalfOfHeaderOnly(t *testing.T) {
+	svc, _, conn := buildService(t)
+	h := New(svc, conn, config.Load()).Routes()
+
+	agent := newIdentity(t, "agent") // carries X-On-Behalf-Of: analyst-j; override below
+	agent["X-On-Behalf-Of"] = "analyst-y"
+
+	// Spoof attempt: body claims on_behalf_of=X, header says Y → rejected,
+	// nothing persisted.
+	rec := do(t, h, "POST", "/v1/observations", map[string]any{
+		"kind":         "alert",
+		"content":      "spoof attempt from spoofed.example.com",
+		"on_behalf_of": "analyst-x",
+	}, agent, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("body-borne on_behalf_of got %d want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	// Header-only path: Y persists.
+	var created struct {
+		ID string `json:"id"`
+	}
+	rec = do(t, h, "POST", "/v1/observations", map[string]any{
+		"kind":    "alert",
+		"content": "delegated action touching header-only.example.com",
+	}, agent, &created)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create failed %d: %s", rec.Code, rec.Body.String())
+	}
+	obsID, err := uuid.Parse(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := conn.QueryRow(context.Background(),
+		"SELECT on_behalf_of FROM mem.observations WHERE obs_id = ?", obsID,
+	).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != "analyst-y" {
+		t.Fatalf("on_behalf_of stored %q, want header value analyst-y", stored)
+	}
+}
+
 func TestHealthzAndSpoofing(t *testing.T) {
 	_, h, _, _ := testServer(t)
 
