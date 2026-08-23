@@ -314,6 +314,72 @@ func caseIDFor(t *testing.T) string {
 	return fmt.Sprintf("00000000-0000-0000-0000-%012d", n)
 }
 
+// TestRetractBodyEdgeCases pins the retract body contract: chunked-style
+// unknown-length bodies and premature EOF degrade to an empty reason, while
+// trailing garbage after the JSON value is a loud 400.
+func TestRetractBodyEdgeCases(t *testing.T) {
+	svc, _, conn := buildService(t)
+	h := New(svc, conn, config.Load()).Routes()
+
+	newFact := func(t *testing.T) string {
+		t.Helper()
+		var f struct {
+			ID string `json:"id"`
+		}
+		rec := do(t, h, "POST", "/v1/facts", map[string]any{
+			"subject_id":   "00000000-0000-0000-0000-000000000002",
+			"predicate":    "edge_case_probe",
+			"object_value": uuid.NewString(),
+		}, newIdentity(t, "human"), &f)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("assert failed %d: %s", rec.Code, rec.Body.String())
+		}
+		return f.ID
+	}
+
+	t.Run("unknown length empty body", func(t *testing.T) {
+		id := newFact(t)
+		req := httptest.NewRequest("POST", "/v1/facts/"+id+"/retract", nil)
+		req.ContentLength = -1 // chunked-style: length unknown
+		for k, v := range newIdentity(t, "human") {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("chunked-style empty retract got %d want 200: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("premature EOF on declared length", func(t *testing.T) {
+		id := newFact(t)
+		req := httptest.NewRequest("POST", "/v1/facts/"+id+"/retract", strings.NewReader(""))
+		req.ContentLength = 64 // declares bytes that never arrive
+		for k, v := range newIdentity(t, "human") {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("premature-EOF retract got %d want 200: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("trailing garbage rejected", func(t *testing.T) {
+		id := newFact(t)
+		req := httptest.NewRequest("POST", "/v1/facts/"+id+"/retract",
+			strings.NewReader(`{"reason":"x"}trailing`))
+		for k, v := range newIdentity(t, "human") {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("trailing garbage retract got %d want 400: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
 // TestOnBehalfOfHeaderOnly pins delegation identity to the X-On-Behalf-Of
 // header only. A body-borne on_behalf_of is an unknown field now and must be
 // rejected loudly (same treatment as body-borne scope), while the header

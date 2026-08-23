@@ -82,7 +82,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	totalPassed, totalQueries := 0, 0
+	totalPassed, totalQueries, totalErrored := 0, 0, 0
 	for _, path := range files {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -102,8 +102,11 @@ func main() {
 			}
 			hits, err := svc.Similar(ctx, ef.Scope, q.Q, k)
 			if err != nil {
-				logger.Error("search failed", "q", q.Q, "err", err)
-				totalQueries++
+				// Errored searches say nothing about recall quality; count
+				// them separately and keep them out of the denominator so
+				// an outage cannot inflate the score.
+				logger.Error("search failed (excluded from score)", "q", q.Q, "err", err)
+				totalErrored++
 				continue
 			}
 			hitSet := map[string]bool{}
@@ -137,7 +140,10 @@ func main() {
 	if totalQueries > 0 {
 		score = float64(totalPassed) / float64(totalQueries)
 	}
-	fmt.Printf("\nrecall: %d/%d = %.2f\n", totalPassed, totalQueries, score)
+	if totalErrored > 0 {
+		fmt.Printf("\nerrored searches excluded from score: %d\n", totalErrored)
+	}
+	fmt.Printf("recall: %d/%d = %.2f\n", totalPassed, totalQueries, score)
 
 	lastPath := filepath.Join(*dir, ".last_score")
 	lastRaw, _ := os.ReadFile(lastPath)

@@ -53,6 +53,13 @@ Humans assert facts (`active`); agents propose them (`proposed`) unless the
 predicate is whitelisted with sufficient confidence. Promotion/retraction is
 human-gated at service level (agents get 403).
 
+## Rate limiting
+
+Agent WRITE endpoints (`POST /v1/*`) are budgeted per `X-Actor-ID` with a
+token bucket (5 req/s, burst 5; over-budget writes get 429 + a `Retry-After`
+header). Humans are exempt — they gate themselves. This is unrelated to
+`MEM_TRUST_*`, which governs agent-fact auto-activation, not throughput.
+
 ## API
 
 | Endpoint | Purpose |
@@ -67,8 +74,9 @@ human-gated at service level (agents get 403).
 | `GET /healthz` | storage ping |
 
 Errors: 400 invalid input · 403 `human_gated` · 404 `fact_not_found` · 409
-`conflict` · 429 rate-limited (agent writes, `Retry-After` header).
-Unknown JSON fields are rejected — typos fail loudly.
+`conflict` · 429 rate-limited (agent writes, `Retry-After` header) · 502
+`storage_error` ("storage temporarily unavailable" — driver detail never
+leaks to clients). Unknown JSON fields are rejected — typos fail loudly.
 
 ## Configuration (env)
 

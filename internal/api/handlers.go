@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -13,15 +15,30 @@ import (
 
 // decodeJSON decodes r.Body with a hard size cap and rejects unknown fields
 // (typos in client payloads fail loudly instead of silently no-oping).
+// Trailing data after the first JSON value is rejected too.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
+	if err := decodeJSONBody(w, r, dst); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return false
 	}
 	return true
+}
+
+// decodeJSONBody performs the strict decode and returns the raw error so
+// callers can special-case io.EOF (the retract endpoint tolerates empty and
+// truncated bodies). After the first value, a second Decode must yield
+// io.EOF — anything else is trailing garbage.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after JSON value")
+	}
+	return nil
 }
 
 // --- POST /v1/observations -------------------------------------------------
@@ -177,9 +194,18 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request, op string) {
 		var req struct {
 			Reason string `json:"reason,omitempty"`
 		}
-		// Retract tolerates an empty body.
-		if r.ContentLength != 0 && !decodeJSON(w, r, &req) {
-			return
+		// Retract tolerates an empty body. Chunked requests report
+		// ContentLength -1 (unknown), so emptiness is judged by > 0 only;
+		// a premature EOF on a length-declared body degrades to an empty
+		// reason rather than a 400.
+		if r.ContentLength > 0 {
+			switch err := decodeJSONBody(w, r, &req); {
+			case errors.Is(err, io.EOF):
+				// premature EOF: treat as empty reason
+			case err != nil:
+				writeErr(w, http.StatusBadRequest, "invalid_body", err.Error())
+				return
+			}
 		}
 		reason = req.Reason
 	}

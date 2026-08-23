@@ -59,6 +59,7 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           api.New(svc, conn, cfg).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -77,7 +78,7 @@ func main() {
 		logger.Info("shutdown signal received")
 	}
 
-	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shCtx); err != nil {
 		logger.Error("graceful shutdown failed", "err", err)
