@@ -14,15 +14,15 @@ projection, fact-extraction pipeline, MCP tools = later phases.
 
 ```bash
 # 1. Dev database
-make db-up                       # ClickHouse 26.3 on :9000 (user mem / memdev)
+task db-up                       # ClickHouse 26.3 on :9000 (user mem / memdev)
 
 # 2. Tests (unit always; integration needs the DB)
-make test                        # unit only
+task test                        # unit only
 MEM_TEST_CH_ADDR=localhost:9000 go test ./... -count=1   # integration
 
 # 3. Run the service (embedding server optional — degrades gracefully)
 lms server start                 # LM Studio with nomic-embed-text-v1.5 loaded
-make run                         # listens on :8080
+task run                         # listens on :8080
 
 # 4. Write + read
 curl -s localhost:8080/v1/observations \
@@ -115,7 +115,7 @@ Edges carry facets (`relation`, validity window). One relation per ordered
 entity pair (last write wins) — known modeling constraint, revisit if hunting
 needs multi-relational pairs. Traversal filters validity at read time.
 
-**Ops:** monitor Dgraph memory (in-memory indexes); `make db-down` wipes both
+**Ops:** monitor Dgraph memory (in-memory indexes); `task db-down` wipes both
 stores; projection lag = watermark ts vs now.
 
 ### Dreaming-lite fact extraction
@@ -123,7 +123,7 @@ stores; projection lag = watermark ts vs now.
 Off by default. Enable with:
 
 ```bash
-MEM_EXTRACT_ENABLED=true MEM_EXTRACT_MODEL=qwen/qwen3-8b make run
+MEM_EXTRACT_ENABLED=true MEM_EXTRACT_MODEL=qwen/qwen3-8b task run
 ```
 
 A worker polls observations lacking fact coverage every 30s, asks the local
