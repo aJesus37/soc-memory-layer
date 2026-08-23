@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -77,17 +76,23 @@ type extractObs struct {
 //
 // Failure semantics, per observation:
 //
-//   - LLM error (the only error class chat.Propose produces): the
-//     observation is STILL covered before the run aborts and the error is
-//     returned; remaining observations stay uncovered for the next tick.
-//     Covering the errored observation trades one lost extraction for
-//     guaranteed queue progress — a model that deterministically fails on
-//     specific content must not wedge everything behind it. Already-
-//     processed observations keep their proposals and coverage rows.
-//   - Cancellation mid-Propose (context.Canceled/DeadlineExceeded): the
-//     observation is deliberately LEFT UNCOVERED when the run aborts, so a
-//     shutdown race retries it on the next startup instead of permanently
-//     burying a never-attempted observation behind an extract_log row.
+//   - LLM error (any chat.Propose error while the run's own context is
+//     still alive): the observation is STILL covered before the run aborts
+//     and the error is returned; remaining observations stay uncovered for
+//     the next tick. Covering the errored observation trades one lost
+//     extraction for guaranteed queue progress — a model that
+//     deterministically fails on specific content must not wedge everything
+//     behind it. Client-side timeouts land here, NOT in the cancellation
+//     class: an http.Client.Timeout surfaces as an error unwrapping to
+//     context.DeadlineExceeded even though nothing is shutting down, so the
+//     error's identity alone cannot distinguish a slow model from a
+//     shutdown race — only the run context can. Already-processed
+//     observations keep their proposals and coverage rows.
+//   - Shutdown racing mid-Propose (the RUN context died, ctx.Err() != nil):
+//     the observation is deliberately LEFT UNCOVERED when the run aborts,
+//     so a shutdown race retries it on the next startup instead of
+//     permanently burying a never-attempted observation behind an
+//     extract_log row.
 //   - Persistence error while applying ONE proposal (resolution or
 //     AssertFact failure): log-and-skip that proposal; sibling proposals
 //     of the same observation still apply, and the observation is covered.
@@ -132,10 +137,14 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 					"obs_id", o.id,
 					"err", aerr)
 			}
-		case isContextErr(perr):
+		case ctx.Err() != nil:
 			// Shutdown raced the propose: leave the observation UNCOVERED so
 			// the next startup retries it — coverage here would permanently
-			// bury an observation that was never actually processed.
+			// bury an observation that was never actually processed. The
+			// branch keys on the RUN context alone: perr's identity cannot
+			// make this call, because a per-request client timeout ALSO
+			// unwraps to context.DeadlineExceeded (classifying it here would
+			// leave every observation behind a slow model uncovered forever).
 			s.log.Info("memory: extraction canceled mid-propose; observation left uncovered for retry",
 				"obs_id", o.id)
 			return asserted, fmt.Errorf("memory: propose facts for observation %s: %w", o.id, perr)
@@ -148,7 +157,7 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 		// Coverage lands AFTER processing (an attempt counts only once it
 		// happened) but BEFORE any error return, so both the errored
 		// observation and every earlier one stay covered when the run
-		// aborts here — except cancellation, which returns above.
+		// aborts here — except a shutdown race, which returns above.
 		if err := s.logExtractionCoverage(ctx, o.id); err != nil {
 			return asserted, fmt.Errorf("memory: cover observation %s: %w", o.id, err)
 		}
@@ -260,12 +269,6 @@ func (s *Service) logExtractionCoverage(ctx context.Context, obsID uuid.UUID) er
 		return fmt.Errorf("insert extract_log row: %w", err)
 	}
 	return nil
-}
-
-// isContextErr reports whether err carries the ctx-cancellation signal
-// (context.Canceled or context.DeadlineExceeded), including wrapped.
-func isContextErr(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // RunExtractionLoop ticks RunExtractionOnce every interval until ctx

@@ -94,9 +94,13 @@ func main() {
 		// Same LM Studio endpoint serves embeddings and chat completions in
 		// the dev topology, so EmbedURL doubles as the chat base URL (the
 		// env name is historical; no separate chat URL exists to configure).
+		// Same generous client timeout as the embedder: local models are
+		// slow to first token and lazily loaded, and the default 60s client
+		// timeout would classify routine slowness as a per-request failure.
 		chat := extract.NewChat(extract.Config{
 			BaseURL: cfg.EmbedURL,
 			Model:   cfg.ExtractModel,
+			HTTP:    &http.Client{Timeout: 120 * time.Second},
 		})
 		go runExtractionWorker(ctx, logger, svc, chat, cfg.ExtractModel,
 			time.Duration(cfg.ExtractIntervalSeconds)*time.Second)

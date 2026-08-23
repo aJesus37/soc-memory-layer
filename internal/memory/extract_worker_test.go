@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -405,14 +406,19 @@ func TestExtractionDedupesActiveFacts(t *testing.T) {
 	}
 }
 
-// canceledChat simulates a propose racing shutdown: every call fails with
-// context.Canceled, like an HTTP client whose request ctx was canceled
-// mid-flight.
-type canceledChat struct{ calls atomic.Int64 }
+// shutdownRacingChat simulates a propose racing shutdown: the run context
+// is canceled WHILE Propose is in flight — exactly what a SIGTERM handler
+// does — and the transport surfaces it as an error wrapping
+// context.Canceled, like net/http does for a request whose ctx died.
+type shutdownRacingChat struct {
+	cancel context.CancelFunc
+	calls  atomic.Int64
+}
 
-func (c *canceledChat) Propose(context.Context, string) ([]extract.Proposal, error) {
+func (c *shutdownRacingChat) Propose(context.Context, string) ([]extract.Proposal, error) {
 	c.calls.Add(1)
-	return nil, context.Canceled
+	c.cancel() // the shutdown signal lands mid-flight
+	return nil, fmt.Errorf("extract: POST http://model/v1/chat/completions: %w", context.Canceled)
 }
 
 // Regression: a cancellation mid-Propose must NOT permanently cover the
@@ -436,8 +442,10 @@ func TestExtractionCancellationLeavesObservationUncovered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cc := &canceledChat{}
-	n, err := s.RunExtractionOnce(ctx, cc, 5)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cc := &shutdownRacingChat{cancel: cancel}
+	n, err := s.RunExtractionOnce(runCtx, cc, 5)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
 	}
@@ -449,6 +457,54 @@ func TestExtractionCancellationLeavesObservationUncovered(t *testing.T) {
 	}
 	if extractionCovered(t, conn, ctx, o.ID) {
 		t.Error("canceled propose covered the observation; a shutdown race would bury it forever")
+	}
+}
+
+// timeoutChat emulates an http.Client whose Timeout fired on a slow model:
+// the transport error unwraps to context.DeadlineExceeded even though the
+// RUN context is perfectly alive. Classifying this as shutdown (the old
+// behavior) left the observation uncovered on every tick — permanently.
+type timeoutChat struct{ calls atomic.Int64 }
+
+func (c *timeoutChat) Propose(context.Context, string) ([]extract.Proposal, error) {
+	c.calls.Add(1)
+	return nil, fmt.Errorf("extract: POST http://model/v1/chat/completions: %w", context.DeadlineExceeded)
+}
+
+// Regression: a client-side timeout with a live run context is an LLM
+// failure, not a shutdown race — the observation MUST be covered before the
+// run aborts so the queue keeps making progress across ticks.
+func TestExtractionClientTimeoutCoversObservation(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	drainExtractionBacklog(t, conn)
+
+	o, err := s.RecordObservation(ctx, Input{
+		Scope:     scope,
+		Kind:      "investigation_note",
+		ActorType: "human",
+		ActorID:   "analyst-j",
+		Content:   "the model times out on this one: slow.example.net resolved_to 198.51.100.24",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tc := &timeoutChat{}
+	n, err := s.RunExtractionOnce(ctx, tc, 5)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if n != 0 {
+		t.Errorf("asserted = %d, want 0", n)
+	}
+	if tc.calls.Load() != 1 {
+		t.Errorf("propose called %d times, want 1", tc.calls.Load())
+	}
+	if !extractionCovered(t, conn, ctx, o.ID) {
+		t.Error("client-timeout observation left uncovered; a slow model would wedge the queue head forever")
 	}
 }
 
