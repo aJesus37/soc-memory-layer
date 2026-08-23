@@ -1,0 +1,4 @@
+{"ts":"2026-07-01T10:00:00Z","kind":"investigation_note","actor_type":"human","actor_id":"analyst-j","scope":"seed-demo","content":"Investigated 203.0.113.7 beaconing to seed-test.example.net — concluded C2"}
+{"ts":"2026-07-02T11:30:00Z","kind":"triage_decision","actor_type":"human","actor_id":"analyst-m","scope":"seed-demo","content":"Closed alert as duplicate of the seed-test beacon case"}
+this line is not json
+{"kind":"alert","actor_type":"agent","actor_id":"bot","scope":"seed-demo","content":""}
