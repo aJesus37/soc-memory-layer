@@ -238,15 +238,20 @@ func (s *Service) Enrich(ctx context.Context, scope, rawKey string, entityType e
 
 	// SQL DISTINCT collapses physical MergeTree duplicates (retry inserts
 	// are an accepted pattern) BEFORE LIMIT fires, so raw duplicate rows
-	// cannot crowd distinct neighbors out of the window. Cross-scope
+	// cannot crowd distinct neighbors out of the window. Both legs filter
+	// on the validity window (valid_to > now64(3)): closed edges —
+	// superseded or retracted — must vanish from the graph view the moment
+	// their lifecycle wave commits, not after some cleanup job. Cross-scope
 	// duplication is impossible: both legs filter on scope. The budget is
 	// maxEnrichNeighborRows (bound via %d, injection-safe), headroom above
 	// the Go-side cap of maxEnrichNeighbors below.
 	edgeRows, err := s.conn.Query(ctx, fmt.Sprintf(
 		"SELECT DISTINCT nid, relation, dir FROM ("+
-			"SELECT dst_id AS nid, relation, 'out' AS dir FROM mem.edges WHERE scope = ? AND src_id = ? "+
+			"SELECT dst_id AS nid, relation, 'out' AS dir FROM mem.edges "+
+			"WHERE scope = ? AND src_id = ? AND valid_to > now64(3) "+
 			"UNION ALL "+
-			"SELECT src_id, relation, 'in' FROM mem.edges WHERE scope = ? AND dst_id = ?"+
+			"SELECT src_id, relation, 'in' FROM mem.edges "+
+			"WHERE scope = ? AND dst_id = ? AND valid_to > now64(3)"+
 			") LIMIT %d", maxEnrichNeighborRows),
 		scopedScope, entID, scopedScope, entID,
 	)

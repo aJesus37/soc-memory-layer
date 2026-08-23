@@ -13,8 +13,9 @@ import (
 	"socmem/internal/entity"
 )
 
-// insertEdge raw-INSERTs one mem.edges row, bypassing the service (Phase 1
-// has no edge writer yet; edges arrive with the Phase-2 graph projection).
+// insertEdge raw-INSERTs one mem.edges row, bypassing the service — used
+// to fabricate graph topology directly; the lifecycle-driven writers live
+// on AssertFact/PromoteFact (insertEdgeIfObject).
 func insertEdge(t *testing.T, ctx context.Context, conn driver.Conn, scope, src, dst, relation string) {
 	t.Helper()
 	srcU, err := uuid.Parse(src)
@@ -197,9 +198,10 @@ func TestEnrich(t *testing.T) {
 		seenObs[o.ID] = true
 	}
 
-	// No edges written yet.
+	// No edges exist here: none of this test's facts carries an object_id,
+	// and facts without an object endpoint never mint edges.
 	if len(res.Neighbors) != 0 {
-		t.Fatalf("no edges yet: %+v", res.Neighbors)
+		t.Fatalf("no neighbors expected without object endpoints: %+v", res.Neighbors)
 	}
 
 	// Unknown key: Found=false, no error, empty slices.
@@ -334,6 +336,55 @@ func TestEnrichNeighbors(t *testing.T) {
 			if i > 0 && res.Neighbors[i-1].EntityID > n.EntityID {
 				t.Fatalf("neighbors not sorted by EntityID: %+v", res.Neighbors)
 			}
+		}
+	})
+
+	// Closure visibility: an edge minted through the REAL lifecycle writers
+	// (AssertFact active-with-object) shows up as a neighbor; once the fact
+	// is retracted, the edge is mutate-closed and must vanish from the
+	// neighbor view immediately — the validity-window filter, not any
+	// cleanup pass, is what hides it.
+	t.Run("closed edges invisible to neighbors", func(t *testing.T) {
+		scope := itestScope()
+		hub := mustResolveEntity(t, conn, scope, "closure-hub.example.com")
+		peer := mustResolveEntity(t, conn, scope, "closure-peer.example.com")
+
+		f, err := s.AssertFact(ctx, FactInput{
+			Scope:       scope,
+			SubjectID:   hub.EntityID,
+			Predicate:   "communicates_with",
+			ObjectValue: "closure-peer.example.com",
+			ObjectID:    peer.EntityID,
+			Confidence:  0.9,
+			ActorType:   "human",
+			ActorID:     "analyst-j",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Status != Active {
+			t.Fatalf("fact = %s, want active", f.Status)
+		}
+
+		res, err := s.Enrich(ctx, scope, "closure-hub.example.com", entity.IocDomain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Neighbors) != 1 || res.Neighbors[0].EntityID != peer.EntityID ||
+			res.Neighbors[0].Relation != "communicates_with" || res.Neighbors[0].Direction != "out" {
+			t.Fatalf("open-edge neighbors = %+v, want exactly the peer out-edge", res.Neighbors)
+		}
+
+		if _, err := s.RetractFact(ctx, f.ID, "wrong direction", "human", "analyst-k"); err != nil {
+			t.Fatal(err)
+		}
+
+		res, err = s.Enrich(ctx, scope, "closure-hub.example.com", entity.IocDomain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Neighbors) != 0 {
+			t.Fatalf("closed edge leaked into neighbor view: %+v", res.Neighbors)
 		}
 	})
 }

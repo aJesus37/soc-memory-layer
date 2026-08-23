@@ -127,9 +127,17 @@ const maxRetractReasonRunes = 120
 // closed and no replacement exists. Accepted for Phase 1; the call logs
 // the lost window and returns the error.
 //
+// Edge lifecycle rides the same transitions: an ACTIVATED fact carrying a
+// non-null object_id mints exactly one mem.edges row
+// (src=subject, dst=object, relation=predicate, from_fact=fact_id); the
+// supersede wave closes the priors' open edges alongside their facts;
+// proposed facts and facts without an object endpoint never mint edges.
+// See insertEdgeIfObject / closeEdgesForPredicate.
+//
 // Audit is best-effort like RecordObservation's: one content-free summary
 // row per write (operation='assert_fact'), noting how many prior facts the
-// mutation closed (superseded=N); failures are logged and swallowed.
+// mutation closed (superseded=N) and whether the write carries a graph
+// edge (edge=y|n); failures are logged and swallowed.
 func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 	fact, err := s.validateFact(in)
 	if err != nil {
@@ -146,6 +154,12 @@ func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 			return Fact{}, err
 		}
 		superseded = n
+		// Same supersede wave closes the priors' open edges. Scoped by
+		// (scope, src_id, relation); edges store relation = predicate,
+		// so sibling predicates' edges are structurally out of reach.
+		if err := s.closeEdgesForPredicate(ctx, fact.scope, fact.subjectUUID, fact.predicate); err != nil {
+			return Fact{}, err
+		}
 	}
 
 	validFrom := time.Now().UTC()
@@ -164,8 +178,28 @@ func (s *Service) AssertFact(ctx context.Context, in FactInput) (Fact, error) {
 		return Fact{}, err
 	}
 
-	summary := fmt.Sprintf("status=%s confidence=%.2f superseded=%d",
-		status, conf, superseded)
+	// Mint the graph edge only for an ACTIVATED fact carrying an object
+	// endpoint — proposals never mint edges — and only after the fact row
+	// committed, so a failure here can never orphan an edge onto a fact
+	// that does not exist. Best-effort like the audit write: the fact
+	// stands; a missing edge degrades the graph view and is surfaced
+	// through the warn log plus a truthful edge=n marker.
+	edgeMark := "n"
+	if status == Active {
+		if err := s.insertEdgeIfObject(ctx, fact, validFrom); err != nil {
+			s.log.Warn("memory: fact edge insert failed; fact stands",
+				"scope", fact.scope,
+				"subject", fact.subjectUUID,
+				"predicate", fact.predicate,
+				"target_id", fact.factUUID,
+				"err", err)
+		} else if fact.objectID != nil {
+			edgeMark = "y"
+		}
+	}
+
+	summary := fmt.Sprintf("status=%s confidence=%.2f superseded=%d edge=%s",
+		status, conf, superseded, edgeMark)
 	if err := s.conn.Exec(ctx,
 		"INSERT INTO mem.audit "+
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
@@ -299,7 +333,9 @@ func (s *Service) loadFactByID(ctx context.Context, factID string) (loadedFact, 
 //
 // Audit is best-effort as everywhere: operation='promote_fact',
 // target_id = the row the transition wrote, payload_summary carries
-// statuses, confidence and the prior row's id only — never content.
+// statuses, confidence, the prior row's id and an edge=y|n marker (the
+// promoted version minted an edge iff it carries an object_id) only —
+// never content.
 func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID string) (Fact, error) {
 	if actorType != actorHuman {
 		return Fact{}, fmt.Errorf("%w: promote_fact by actor type %q", ErrHumanGated, actorType)
@@ -333,12 +369,26 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 	}
 	s.closePriorVersion(ctx, old.factID, "promote_fact")
 
+	// The promoted version is active: if it carries an object endpoint it
+	// mints its own edge (a proposal never minted one). Best-effort like
+	// the audit write — the replacement already owns the FINAL read path.
+	edgeMark := "n"
+	if err := s.insertEdgeIfObject(ctx, next, now); err != nil {
+		s.log.Warn("memory: promoted fact edge insert failed; fact stands",
+			"operation", "promote_fact",
+			"target_id", next.factUUID,
+			"err", err)
+	} else if next.objectID != nil {
+		edgeMark = "y"
+	}
+
 	if err := s.conn.Exec(ctx,
 		"INSERT INTO mem.audit "+
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
 			"VALUES (?, ?, ?, ?, ?, ?)",
 		actorHuman, author, "promote_fact", "facts", next.factUUID,
-		fmt.Sprintf("from=proposed to=active confidence=%.2f prior=%s", old.confidence, old.factID),
+		fmt.Sprintf("from=proposed to=active confidence=%.2f prior=%s edge=%s",
+			old.confidence, old.factID, edgeMark),
 	); err != nil {
 		s.log.Warn("memory: audit insert failed; fact stands",
 			"operation", "promote_fact",
@@ -376,8 +426,10 @@ func (s *Service) PromoteFact(ctx context.Context, factID, actorType, actorID st
 // shadowed by a winning concurrent promote. Accepted Phase-1 posture.
 //
 // Audit is best-effort: operation='retract_fact', target_id = the row the
-// transition wrote, summary "from=<prior status>" plus the capped reason
-// and the prior row's id.
+// transition wrote, summary "from=<prior status>" plus the capped reason,
+// the prior row's id, and an edge=y|n marker (y iff the fact carries an
+// object endpoint, i.e. its activation minted edges that this transition
+// closes).
 func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, actorID string) (Fact, error) {
 	if actorType != actorHuman {
 		return Fact{}, fmt.Errorf("%w: retract_fact by actor type %q", ErrHumanGated, actorType)
@@ -412,13 +464,32 @@ func (s *Service) RetractFact(ctx context.Context, factID, reason, actorType, ac
 	}
 	s.closePriorVersion(ctx, old.factID, "retract_fact")
 
+	// Close the edges the fact minted at activation (from_fact = the prior
+	// version's id). A proposal never minted edges, so the call is a
+	// harmless no-op there. Best-effort like closePriorVersion: the
+	// retraction already owns the read path; a lingering open edge is
+	// logged for operator action rather than misreporting a committed
+	// retraction as failed.
+	edgeMark := "n"
+	if err := s.closeEdgesByFromFact(ctx, old.factID); err != nil {
+		s.log.Warn("memory: retracting fact edges failed; retraction stands",
+			"operation", "retract_fact",
+			"target_id", next.factUUID,
+			"from_fact", old.factID,
+			"err", err)
+	} else if old.objectID != nil {
+		edgeMark = "y"
+	}
+
 	summary := fmt.Sprintf("from=%s", old.status)
 	if r := sanitizeReason(reason); r != "" {
 		summary += " reason=" + r
 	}
-	// prior=<old fact uuid> appended last: pure metadata linking the
-	// replacement to the row it superseded (carry-over from review).
+	// prior=<old fact uuid> appended last-but-one: pure metadata linking the
+	// replacement to the row it superseded (carry-over from review), with
+	// edge=y|n after it recording whether this transition closed edge rows.
 	summary += fmt.Sprintf(" prior=%s", old.factID)
+	summary += fmt.Sprintf(" edge=%s", edgeMark)
 	if err := s.conn.Exec(ctx,
 		"INSERT INTO mem.audit "+
 			"(actor_type, actor_id, operation, target_table, target_id, payload_summary) "+
@@ -613,6 +684,78 @@ func (s *Service) closeFactByID(ctx context.Context, factID uuid.UUID) error {
 	)
 	if err != nil {
 		return fmt.Errorf("memory: close fact %s: %w", factID, err)
+	}
+	return nil
+}
+
+// insertEdgeIfObject writes the graph edge of an ACTIVATED fact carrying a
+// non-null object_id: one mem.edges row with src = subject, dst = object,
+// relation = predicate and from_fact = the minting fact's id, valid_from
+// mirroring the fact's own validity start and valid_to the open-ended
+// sentinel — the edge stays open until a supersede wave or a retraction
+// closes it. Proposed facts and facts without an object endpoint never
+// produce edges: both cases are a silent no-op. Callers invoke this only
+// AFTER the fact row committed (an edge must never outlive-orphan its
+// fact) and treat an error as best-effort degradation, since the fact
+// itself already stands.
+func (s *Service) insertEdgeIfObject(ctx context.Context, f factArgs, validFrom time.Time) error {
+	if f.objectID == nil {
+		return nil
+	}
+	b, err := s.conn.PrepareBatch(ctx,
+		"INSERT INTO mem.edges "+
+			"(edge_id, scope, src_id, dst_id, relation, from_fact, valid_from, valid_to)")
+	if err != nil {
+		return fmt.Errorf("memory: stage edge insert: %w", err)
+	}
+	if err := b.Append(
+		uuid.New(), f.scope, f.subjectUUID, *f.objectID, f.predicate, f.factUUID,
+		validFrom, farFuture,
+	); err != nil {
+		return fmt.Errorf("memory: append edge row: %w", err)
+	}
+	if err := b.Send(); err != nil {
+		return fmt.Errorf("memory: commit edge for fact %s: %w", f.factUUID, err)
+	}
+	return nil
+}
+
+// closeEdgesForPredicate mutate-closes every OPEN edge of one
+// (scope, src_id, relation): the edge-space twin of closeOpenFacts, run in
+// the same supersede wave so that once AssertFact returns, exactly the new
+// fact's edge is open for the key. Edges store relation = predicate, so
+// the filter structurally cannot bleed into sibling predicates' edges.
+// No pre-count (nothing to report into the audit summary) and
+// mutations_sync = 1 like every mutation here, so this helper's own later
+// edge insert can never be closed by its own wave.
+func (s *Service) closeEdgesForPredicate(ctx context.Context, scope string, src uuid.UUID, relation string) error {
+	err := s.conn.Exec(ctx,
+		"ALTER TABLE mem.edges UPDATE valid_to = ? "+
+			"WHERE scope = ? AND src_id = ? AND relation = ? "+
+			"AND valid_to > now64(3) "+
+			"SETTINGS mutations_sync = 1",
+		time.Now().UTC(), scope, src, relation,
+	)
+	if err != nil {
+		return fmt.Errorf("memory: supersede open edges (scope=%s): %w", scope, err)
+	}
+	return nil
+}
+
+// closeEdgesByFromFact mutate-closes every open edge minted by ONE fact —
+// the edge-space twin of closeFactByID, scoped to from_fact alone so a
+// retract can never disturb edges belonging to sibling facts that merely
+// share (scope, subject_id, predicate). Used by RetractFact after its
+// replacement committed; mutations_sync = 1 as everywhere.
+func (s *Service) closeEdgesByFromFact(ctx context.Context, fromFact uuid.UUID) error {
+	err := s.conn.Exec(ctx,
+		"ALTER TABLE mem.edges UPDATE valid_to = ? "+
+			"WHERE from_fact = ? AND valid_to > now64(3) "+
+			"SETTINGS mutations_sync = 1",
+		time.Now().UTC(), fromFact,
+	)
+	if err != nil {
+		return fmt.Errorf("memory: close edges of fact %s: %w", fromFact, err)
 	}
 	return nil
 }

@@ -971,7 +971,7 @@ func TestRetractFact(t *testing.T) {
 	if op != "retract_fact" || actorType != "human" || table != "facts" {
 		t.Errorf("audit shape wrong: op=%q actor=%q table=%q", op, actorType, table)
 	}
-	if want := "from=active reason=" + long[:120] + " prior=" + active.ID; summary != want {
+	if want := "from=active reason=" + long[:120] + " prior=" + active.ID + " edge=n"; summary != want {
 		t.Errorf("payload_summary = %q, want %q", summary, want)
 	}
 
@@ -1002,7 +1002,393 @@ func TestRetractFact(t *testing.T) {
 	}
 	propRetrUUID, _ := uuid.Parse(retrProp.ID)
 	op, _, _, summary = queryAudit(t, conn, ctx, propRetrUUID)
-	if want := "from=proposed prior=" + prop.ID; op != "retract_fact" || summary != want {
+	if want := "from=proposed prior=" + prop.ID + " edge=n"; op != "retract_fact" || summary != want {
 		t.Errorf("proposal-retract audit: op=%q summary=%q, want %q (empty reason omitted)", op, summary, want)
+	}
+}
+
+// edgeRow is one mem.edges row loaded raw — no FINAL: mem.edges is a plain
+// MergeTree and the lifecycle waves mutate valid_to in place.
+type edgeRow struct {
+	edgeID    uuid.UUID
+	scope     string
+	srcID     uuid.UUID
+	dstID     uuid.UUID
+	relation  string
+	fromFact  uuid.UUID
+	validFrom time.Time
+	validTo   time.Time
+}
+
+// openEdgeRow reports whether an edge is still inside its validity window:
+// anything not carrying the far-future sentinel was closed by a supersede
+// or retract wave.
+func openEdgeRow(e edgeRow) bool { return e.validTo.Year() > 2100 }
+
+// queryScopeEdges loads every mem.edges row of one scope raw. Tests isolate
+// by unique scope, so scope-wide counts are exact.
+func queryScopeEdges(t *testing.T, ctx context.Context, conn driver.Conn, scope string) []edgeRow {
+	t.Helper()
+	rows, err := conn.Query(ctx,
+		"SELECT edge_id, scope, src_id, dst_id, relation, from_fact, valid_from, valid_to "+
+			"FROM mem.edges WHERE scope = ?", scope,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []edgeRow
+	for rows.Next() {
+		var e edgeRow
+		if err := rows.Scan(&e.edgeID, &e.scope, &e.srcID, &e.dstID,
+			&e.relation, &e.fromFact, &e.validFrom, &e.validTo); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// mustEdgeByDst returns the single edge pointing at dst, failing on any
+// other cardinality.
+func mustEdgeByDst(t *testing.T, edges []edgeRow, dst uuid.UUID) edgeRow {
+	t.Helper()
+	var found []edgeRow
+	for _, e := range edges {
+		if e.dstID == dst {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("edges with dst %s = %d (%+v), want exactly 1", dst, len(found), edges)
+	}
+	return found[0]
+}
+
+// TestActiveFactWithObjectCreatesEdge pins the core invariant: an active
+// fact carrying an object_id mints EXACTLY ONE open edge row with
+// src=subject, dst=object, relation=predicate, from_fact=fact id — and its
+// audit summary carries the edge=y marker without leaking endpoints.
+func TestActiveFactWithObjectCreatesEdge(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "edge-active.example.com")
+	obj := mustResolveEntity(t, conn, scope, "198.51.100.7")
+
+	f, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "resolved_to",
+		ObjectValue: "198.51.100.7",
+		ObjectID:    obj.EntityID,
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Status != Active {
+		t.Fatalf("human fact = %s, want active", f.Status)
+	}
+
+	edges := queryScopeEdges(t, ctx, conn, scope)
+	if len(edges) != 1 {
+		t.Fatalf("edges in scope = %d (%+v), want exactly 1", len(edges), edges)
+	}
+	e := edges[0]
+	fUUID := uuid.MustParse(f.ID)
+	if e.srcID != uuid.MustParse(subj.EntityID) ||
+		e.dstID != uuid.MustParse(obj.EntityID) ||
+		e.relation != "resolved_to" ||
+		e.fromFact != fUUID {
+		t.Errorf("edge endpoints wrong: %+v (fact %+v)", e, f)
+	}
+	if !openEdgeRow(e) {
+		t.Errorf("freshly minted edge born closed: valid_to=%v", e.validTo)
+	}
+
+	op, _, _, summary := queryAudit(t, conn, ctx, fUUID)
+	if op != "assert_fact" || !strings.Contains(summary, "edge=y") {
+		t.Errorf("audit missing edge=y marker: op=%q summary=%q", op, summary)
+	}
+	for _, secret := range []string{"198.51.100.7", obj.EntityID} {
+		if strings.Contains(summary, secret) {
+			t.Errorf("payload_summary leaks %q: %q", secret, summary)
+		}
+	}
+}
+
+// TestProposedFactNoEdge: proposals NEVER mint edges, even when they carry
+// an object endpoint — edges appear only at activation.
+func TestProposedFactNoEdge(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "edge-proposed.example.com")
+	obj := mustResolveEntity(t, conn, scope, "203.0.113.9")
+
+	f, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious", // non-whitelisted: agent lands proposed
+		ObjectValue: "maybe-c2",
+		ObjectID:    obj.EntityID,
+		Confidence:  0.99,
+		ActorType:   "agent",
+		ActorID:     "triage-bot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Status != Proposed {
+		t.Fatalf("agent non-whitelisted fact = %s, want proposed", f.Status)
+	}
+
+	if edges := queryScopeEdges(t, ctx, conn, scope); len(edges) != 0 {
+		t.Fatalf("proposed fact minted edges: %+v", edges)
+	}
+
+	_, _, _, summary := queryAudit(t, conn, ctx, uuid.MustParse(f.ID))
+	if !strings.Contains(summary, "edge=n") {
+		t.Errorf("audit missing edge=n marker for proposal: %q", summary)
+	}
+}
+
+// TestSupersedeClosesSiblingEdges walks A(c2→obj-x) superseded by
+// B(benign-parked→obj-y) on one predicate, with a SIBLING-PREDICATE edge
+// (hosting→obj-z) planted alongside. The supersede wave must close A's
+// edge only: B's fresh edge and the hosting edge stay open — proving both
+// that closure happens and that scoping by relation=predicate prevents
+// cross-predicate bleed.
+func TestSupersedeClosesSiblingEdges(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "edge-supersede.example.com")
+	objX := mustResolveEntity(t, conn, scope, "obj-x.example.com")
+	objY := mustResolveEntity(t, conn, scope, "obj-y.example.com")
+	objZ := mustResolveEntity(t, conn, scope, "obj-z.example.com")
+
+	assert := func(predicate, value string, obj entity.Entity) Fact {
+		f, err := s.AssertFact(ctx, FactInput{
+			Scope:       scope,
+			SubjectID:   subj.EntityID,
+			Predicate:   predicate,
+			ObjectValue: value,
+			ObjectID:    obj.EntityID,
+			Confidence:  0.9,
+			ActorType:   "human",
+			ActorID:     "analyst-j",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	fa := assert("verdict_malicious", "c2", objX)
+	fz := assert("hosting", "bulletproof", objZ)
+	fb := assert("verdict_malicious", "benign-parked", objY)
+
+	edges := queryScopeEdges(t, ctx, conn, scope)
+	if len(edges) != 3 {
+		t.Fatalf("edges in scope = %d (%+v), want exactly 3 (A closed + B and Z open)", len(edges), edges)
+	}
+
+	ea := mustEdgeByDst(t, edges, uuid.MustParse(objX.EntityID))
+	if ea.fromFact != uuid.MustParse(fa.ID) {
+		t.Errorf("closed edge belongs to fact %s, want A %s", ea.fromFact, fa.ID)
+	}
+	if openEdgeRow(ea) {
+		t.Errorf("superseded A edge still open: valid_to=%v", ea.validTo)
+	}
+
+	eb := mustEdgeByDst(t, edges, uuid.MustParse(objY.EntityID))
+	if !openEdgeRow(eb) || eb.fromFact != uuid.MustParse(fb.ID) || eb.relation != "verdict_malicious" {
+		t.Errorf("B edge wrong: %+v (fact %+v)", eb, fb)
+	}
+
+	// Cross-predicate bleed check: the hosting edge must be untouched.
+	ez := mustEdgeByDst(t, edges, uuid.MustParse(objZ.EntityID))
+	if !openEdgeRow(ez) || ez.fromFact != uuid.MustParse(fz.ID) || ez.relation != "hosting" {
+		t.Errorf("sibling-predicate edge disturbed by supersede: %+v (fact %+v)", ez, fz)
+	}
+
+	_, _, _, summary := queryAudit(t, conn, ctx, uuid.MustParse(fb.ID))
+	if !strings.Contains(summary, "superseded=1") || !strings.Contains(summary, "edge=y") {
+		t.Errorf("B audit missing superseded=1/edge=y markers: %q", summary)
+	}
+}
+
+// TestPromotedProposalCreatesEdge: a proposal carrying an object endpoint
+// mints nothing; its PROMOTED version becomes active and mints the edge
+// under ITS OWN fact id — never the consumed proposal's.
+func TestPromotedProposalCreatesEdge(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "edge-promote.example.com")
+	objP := mustResolveEntity(t, conn, scope, "obj-p.example.com")
+
+	prop, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "maybe-c2",
+		ObjectID:    objP.EntityID,
+		Confidence:  0.99,
+		ActorType:   "agent",
+		ActorID:     "triage-bot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prop.Status != Proposed {
+		t.Fatalf("proposal status = %s, want proposed", prop.Status)
+	}
+	if edges := queryScopeEdges(t, ctx, conn, scope); len(edges) != 0 {
+		t.Fatalf("proposal minted edges before promotion: %+v", edges)
+	}
+
+	time.Sleep(1100 * time.Millisecond) // keep updated_at distinct per wave
+	promoted, err := s.PromoteFact(ctx, prop.ID, "human", "analyst-k")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	edges := queryScopeEdges(t, ctx, conn, scope)
+	if len(edges) != 1 {
+		t.Fatalf("edges after promote = %d (%+v), want exactly 1", len(edges), edges)
+	}
+	e := edges[0]
+	if !openEdgeRow(e) || e.fromFact != uuid.MustParse(promoted.ID) ||
+		e.fromFact == uuid.MustParse(prop.ID) ||
+		e.dstID != uuid.MustParse(objP.EntityID) ||
+		e.srcID != uuid.MustParse(subj.EntityID) ||
+		e.relation != "verdict_malicious" {
+		t.Errorf("promoted edge wrong: %+v (promoted %+v)", e, promoted)
+	}
+
+	_, _, _, propSummary := queryAudit(t, conn, ctx, uuid.MustParse(prop.ID))
+	if !strings.Contains(propSummary, "edge=n") {
+		t.Errorf("proposal audit missing edge=n: %q", propSummary)
+	}
+	_, _, _, promSummary := queryAudit(t, conn, ctx, uuid.MustParse(promoted.ID))
+	if !strings.Contains(promSummary, "edge=y") {
+		t.Errorf("promote audit missing edge=y: %q", promSummary)
+	}
+}
+
+// TestRetractClosesEdge: retracting an edge-bearing fact closes exactly
+// that fact's edges — the physical row survives (MergeTree, never deleted)
+// but leaves the validity window, so graph readers stop seeing the link.
+func TestRetractClosesEdge(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "edge-retract.example.com")
+	objR := mustResolveEntity(t, conn, scope, "192.0.2.44")
+
+	f, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "resolved_to",
+		ObjectValue: "192.0.2.44",
+		ObjectID:    objR.EntityID,
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edges := queryScopeEdges(t, ctx, conn, scope); len(edges) != 1 || !openEdgeRow(edges[0]) {
+		t.Fatalf("pre-retract edges = %+v, want exactly one open", edges)
+	}
+
+	r, err := s.RetractFact(ctx, f.ID, "false positive", "human", "analyst-k")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	edges := queryScopeEdges(t, ctx, conn, scope)
+	if len(edges) != 1 {
+		t.Fatalf("post-retract edges = %+v, want the same single row (never deleted)", edges)
+	}
+	e := edges[0]
+	if openEdgeRow(e) {
+		t.Errorf("retracted fact's edge still open: valid_to=%v", e.validTo)
+	}
+	if e.fromFact != uuid.MustParse(f.ID) || e.dstID != uuid.MustParse(objR.EntityID) {
+		t.Errorf("closed edge identity drifted: %+v (fact %+v)", e, f)
+	}
+
+	op, _, _, summary := queryAudit(t, conn, ctx, uuid.MustParse(r.ID))
+	if op != "retract_fact" || !strings.Contains(summary, "edge=y") {
+		t.Errorf("retract audit missing edge=y: op=%q summary=%q", op, summary)
+	}
+}
+
+// TestFactWithoutObjectNeverEdges: facts WITHOUT an object endpoint never
+// produce edges — neither human assertions nor auto-activated whitelisted
+// agent facts.
+func TestFactWithoutObjectNeverEdges(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "edge-noobject.example.com")
+
+	human, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "seen_at",
+		ObjectValue: "somewhere",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if human.Status != Active {
+		t.Fatalf("human fact = %s, want active", human.Status)
+	}
+
+	// Whitelisted predicate above floor: agent auto-activates, still no
+	// object endpoint → still no edge.
+	agent, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "resolved_to",
+		ObjectValue: "elsewhere.example.net",
+		Confidence:  0.95,
+		ActorType:   "agent",
+		ActorID:     "sensor-7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status != Active {
+		t.Fatalf("whitelisted agent fact = %s, want active", agent.Status)
+	}
+
+	if edges := queryScopeEdges(t, ctx, conn, scope); len(edges) != 0 {
+		t.Fatalf("object-less facts minted edges: %+v", edges)
+	}
+	for _, f := range []Fact{human, agent} {
+		_, _, _, summary := queryAudit(t, conn, ctx, uuid.MustParse(f.ID))
+		if !strings.Contains(summary, "edge=n") {
+			t.Errorf("audit missing edge=n for fact written by %q: %q", f.WrittenBy, summary)
+		}
 	}
 }
