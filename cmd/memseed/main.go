@@ -43,12 +43,28 @@ type seedLine struct {
 	Content         string `json:"content"`
 }
 
+// factLine asserts a human fact. subject_key/object_key are normalized
+// through the entity resolver (created on first sight), matching how the
+// API resolves keys.
+type factLine struct {
+	Scope        string  `json:"scope"`
+	SubjectKey   string  `json:"subject_key"`
+	Predicate    string  `json:"predicate"`
+	ObjectValue  string  `json:"object_value"`
+	ObjectKey    string  `json:"object_key,omitempty"`
+	Confidence   float32 `json:"confidence,omitempty"`
+	ActorType    string  `json:"actor_type,omitempty"`
+	ActorID      string  `json:"actor_id,omitempty"`
+	ClientEventID string `json:"client_event_id,omitempty"`
+}
+
 func main() {
 	file := flag.String("file", "", "JSONL file to ingest (required)")
+	factsFile := flag.String("facts", "", "JSONL file of human fact assertions (optional)")
 	dryRun := flag.Bool("dry-run", false, "parse-check lines only; write nothing")
 	flag.Parse()
 	if *file == "" {
-		fmt.Fprintln(os.Stderr, "usage: memseed -file seeds/history.jsonl [-dry-run]")
+		fmt.Fprintln(os.Stderr, "usage: memseed -file seeds/history.jsonl [-facts seeds/facts.jsonl] [-dry-run]")
 		os.Exit(2)
 	}
 
@@ -80,6 +96,15 @@ func main() {
 		entity.NewResolver(conn),
 		embed.NewOpenAI(embed.Config{BaseURL: cfg.EmbedURL, Model: cfg.EmbedModel}),
 		cfg)
+
+	if *factsFile != "" && !*dryRun {
+		n, err := seedFacts(ctx, logger, svc, entity.NewResolver(conn), *factsFile)
+		if err != nil {
+			logger.Error("fact seeding failed", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("facts asserted", "count", n)
+	}
 
 	var (
 		written, skipped, failed int
@@ -147,4 +172,73 @@ func main() {
 	if failed > 0 {
 		os.Exit(1)
 	}
+}
+
+// seedFacts asserts human facts from a JSONL file:
+// {"scope":"team-a","subject_key":"evil.example.com","predicate":"resolved_to",
+//  "object_value":"198.51.100.23","object_key":"198.51.100.23","confidence":0.95,
+//  "actor_type":"human","actor_id":"analyst-j"}
+func seedFacts(ctx context.Context, logger *slog.Logger, svc *memory.Service, res *entity.Resolver, path string) (int, error) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer fh.Close()
+
+	var asserted int
+	scanner := bufio.NewScanner(fh)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var fl factLine
+		if err := json.Unmarshal([]byte(line), &fl); err != nil {
+			logger.Warn("unparseable fact line", "line", lineNo, "err", err)
+			continue
+		}
+		actorType := fl.ActorType
+		if actorType == "" {
+			actorType = "human"
+		}
+		actorID := fl.ActorID
+		if actorID == "" {
+			actorID = "seeder"
+		}
+		subj, _, err := res.Resolve(ctx, fl.Scope, fl.SubjectKey)
+		if err != nil {
+			logger.Warn("subject resolve failed", "line", lineNo, "key", fl.SubjectKey, "err", err)
+			continue
+		}
+		var objID string
+		if fl.ObjectKey != "" {
+			obj, _, err := res.Resolve(ctx, fl.Scope, fl.ObjectKey)
+			if err != nil {
+				logger.Warn("object resolve failed", "line", lineNo, "key", fl.ObjectKey, "err", err)
+				continue
+			}
+			objID = obj.EntityID
+		}
+		if _, err := svc.AssertFact(ctx, memory.FactInput{
+			Scope:        fl.Scope,
+			SubjectID:    subj.EntityID,
+			Predicate:    fl.Predicate,
+			ObjectValue:  fl.ObjectValue,
+			ObjectID:     objID,
+			Confidence:   fl.Confidence,
+			ActorType:    actorType,
+			ActorID:      actorID,
+		}); err != nil {
+			if errors.Is(err, memory.ErrInvalidInput) {
+				logger.Warn("invalid fact line", "line", lineNo, "err", err)
+				continue
+			}
+			return asserted, fmt.Errorf("fact line %d: %w", lineNo, err)
+		}
+		asserted++
+	}
+	return asserted, scanner.Err()
 }

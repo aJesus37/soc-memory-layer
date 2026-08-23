@@ -1,0 +1,12 @@
+name: demo
+scope: team-threatresp
+queries:
+  - q: "what did we conclude about the phishing domain infrastructure?"
+    must_reference_entities: ["secure-portal.invoice-update.com"]
+    k: 10
+  - q: "beaconing C2 endpoints in the finance incident"
+    must_reference_entities: ["203.0.113.77"]
+    k: 10
+  - q: "which malware loader was retrieved from the workstation?"
+    must_reference_entities: ["9f2b8c1d4e6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e"]
+    k: 10

@@ -333,3 +333,18 @@ func TestProposeUnconfiguredClient(t *testing.T) {
 		t.Fatal("want error for unconfigured client, got nil")
 	}
 }
+
+func TestParseArrayStripsThinkBlocks(t *testing.T) {
+	in := "<think>\nLet me analyze the note. The IP is mentioned.\n</think>\n[{\"subject\":\"203.0.113.7\",\"predicate\":\"resolved_to\",\"object_value\":\"evil.net\",\"confidence\":0.9}]"
+	proposals, err := parseArray(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proposals) != 1 || proposals[0].Subject != "203.0.113.7" {
+		t.Fatalf("got %+v", proposals)
+	}
+	// unterminated think block: model never answered
+	if _, err := parseArray("<think>only reasoning so far and no close"); err == nil {
+		t.Fatal("unterminated think block should error")
+	}
+}

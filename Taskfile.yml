@@ -53,3 +53,21 @@ tasks:
     desc: Run recall@k evals (exits 1 on regression)
     cmds:
       - go run ./cmd/memeval
+
+  demo-seed:
+    desc: Ingest the PHANTOM PORTAL synthetic investigation (3 teams + agents + facts)
+    cmds:
+      - go run ./cmd/memseed -file seeds/phantom-portal/observations.jsonl -facts seeds/phantom-portal/facts.jsonl
+
+  run-extract:
+    desc: Run the service with dreaming-lite extraction enabled
+    env:
+      MEM_EXTRACT_ENABLED: "true"
+      MEM_EXTRACT_MODEL: qwen/qwen3-8b
+    cmds:
+      - go run ./cmd/memserved
+
+  mcp:
+    desc: Build memmcp for local stdio use
+    cmds:
+      - go build -o memmcp ./cmd/memmcp

@@ -171,11 +171,11 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 	return Sanitize(raws), nil
 }
 
-// parseArray pulls a JSON array out of arbitrary model text: strips code
-// fences, then slices from the first '[' to the last ']' so preamble and
-// trailing commentary do not break decoding.
+// parseArray pulls a JSON array out of arbitrary model text: strips
+// reasoning/think blocks and code fences, then slices from the first '[' to
+// the last ']' so preamble and trailing commentary do not break decoding.
 func parseArray(content string) ([]RawProposal, error) {
-	s := stripFences(content)
+	s := stripThinkBlocks(stripFences(content))
 
 	start := strings.Index(s, "[")
 	end := strings.LastIndex(s, "]")
@@ -188,6 +188,24 @@ func parseArray(content string) ([]RawProposal, error) {
 		return nil, fmt.Errorf("extract: parse proposals: %w", err)
 	}
 	return raws, nil
+}
+
+// stripThinkBlocks removes <think>…</think> reasoning blocks that thinking
+// models (Qwen3, DeepSeek-R1, …) emit before their answer. Non-greedy so
+// multiple blocks are each removed; unterminated think blocks swallow the
+// remainder (the model never answered).
+func stripThinkBlocks(s string) string {
+	for {
+		open := strings.Index(s, "<think>")
+		if open < 0 {
+			return s
+		}
+		close_ := strings.Index(s[open:], "</think>")
+		if close_ < 0 {
+			return strings.TrimSpace(s[:open])
+		}
+		s = s[:open] + s[open+close_+len("</think>"):]
+	}
 }
 
 // stripFences removes a leading markdown code fence (``` or ```lang)

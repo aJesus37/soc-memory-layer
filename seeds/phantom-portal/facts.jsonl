@@ -1,0 +1,6 @@
+{"scope":"team-threatresp","subject_key":"secure-portal.invoice-update.com","predicate":"verdict_malicious","object_value":"phishing-infra","confidence":0.95,"actor_id":"analyst-j"}
+{"scope":"team-threatresp","subject_key":"secure-portal.invoice-update.com","predicate":"resolved_to","object_value":"203.0.113.77","object_key":"203.0.113.77","confidence":0.95,"actor_id":"analyst-j"}
+{"scope":"team-hunt","subject_key":"ws-fin-0042.corp.company.com","predicate":"beaconed_to","object_value":"203.0.113.77","object_key":"203.0.113.77","confidence":0.9,"actor_id":"analyst-c"}
+{"scope":"team-threatresp","subject_key":"9f2b8c1d4e6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e","predicate":"attributed_to","object_value":"phantom-panda","confidence":0.85,"actor_id":"analyst-j"}
+{"scope":"team-threatresp","subject_key":"T1566.002","predicate":"used_by","object_value":"phantom-panda","confidence":0.8,"actor_id":"analyst-j"}
+{"scope":"team-hunt","subject_key":"198.51.100.23","predicate":"verdict_malicious","object_value":"c2-endpoint","confidence":0.9,"actor_id":"analyst-c"}

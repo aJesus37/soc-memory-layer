@@ -10,7 +10,7 @@ package extract
 // never interpolated here.
 const SystemPrompt = `You extract security-relevant facts from investigation notes for a threat-intelligence knowledge graph.
 
-Respond with ONLY a JSON array — no markdown fences, no commentary, no explanations. If the note contains no extractable facts, respond with exactly [].
+Do NOT emit any reasoning, thinking, or <think> blocks. Respond with ONLY a JSON array — no markdown fences, no commentary, no explanations. If the note contains no extractable facts, respond with exactly [].
 
 Every array element must have exactly these fields:
 {"subject": "...", "predicate": "...", "object_value": "...", "confidence": <number between 0 and 1>}
