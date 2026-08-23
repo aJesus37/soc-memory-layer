@@ -1,0 +1,55 @@
+version: '3'
+
+vars:
+  TEST_ENV: MEM_TEST_CH_ADDR=localhost:9000,MEM_TEST_DGRAPH_ADDR=localhost:9080
+
+tasks:
+  build:
+    desc: Build all binaries
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run unit tests (no databases required)
+    cmds:
+      - go test ./...
+
+  itest:
+    desc: Run the full suite against live ClickHouse + Dgraph
+    deps: [db-up]
+    cmds:
+      - go test -count=1 -p 1 ./...
+    env:
+      MEM_TEST_CH_ADDR: localhost:9000
+      MEM_TEST_DGRAPH_ADDR: localhost:9080
+
+  db-up:
+    desc: Start the dev stack (ClickHouse + Dgraph), waits for health
+    cmds:
+      - docker compose up -d --wait clickhouse dgraph
+
+  db-down:
+    desc: Stop the stack and wipe volumes
+    cmds:
+      - docker compose down -v
+
+  run:
+    desc: Run the memory service API
+    cmds:
+      - go run ./cmd/memserved
+
+  swagger:
+    desc: Regenerate OpenAPI spec from handler annotations
+    cmds:
+      - swag fmt
+      - swag init --parseDependency --parseInternal -g cmd/memserved/main.go -o docs
+
+  seed:
+    desc: Backfill seeds/smoke.jsonl into the running service's ClickHouse
+    cmds:
+      - go run ./cmd/memseed -file seeds/smoke.jsonl
+
+  eval:
+    desc: Run recall@k evals (exits 1 on regression)
+    cmds:
+      - go run ./cmd/memeval
