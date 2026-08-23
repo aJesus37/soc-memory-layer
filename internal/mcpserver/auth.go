@@ -132,8 +132,8 @@ type TokenAuth struct {
 }
 
 // NewTokenAuth builds the authenticator from validated records. Records
-// should come from LoadTokenFile (which enforces uniqueness and shape);
-// given duplicates here, the first occurrence wins.
+// should come from LoadTokenFile, which rejects duplicate tokens, so the
+// mapping holds unique tokens only.
 func NewTokenAuth(records []TokenRecord) *TokenAuth {
 	cp := make([]TokenRecord, len(records))
 	copy(cp, records)

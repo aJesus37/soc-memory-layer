@@ -194,7 +194,18 @@ func runHTTP(ctx context.Context, logger *slog.Logger, srv *server.MCPServer, ad
 	}
 	auth := mcpserver.NewTokenAuth(records)
 
+	// WithDisableLocalhostProtection consciously turns off mcp-go's
+	// DNS-rebinding guard, which would otherwise 403 any request whose
+	// Host header is not a localhost value — silently breaking the
+	// DOCUMENTED topology (bind loopback + terminate TLS at a reverse
+	// proxy), where the proxy forwards the original public Host header.
+	// It is safe to disable here because it is SUBSUMED by the auth gate:
+	// every request passes TokenAuth.Middleware (bearer-token check)
+	// before reaching the MCP handler, so a rebinding attacker without a
+	// token gets 401 regardless of what Host they present. Do not reuse
+	// this option on an unauthenticated MCP endpoint.
 	streamable := server.NewStreamableHTTPServer(srv,
+		server.WithDisableLocalhostProtection(true),
 		server.WithHTTPContextFunc(auth.HTTPContextInjector()))
 
 	mux := http.NewServeMux()
