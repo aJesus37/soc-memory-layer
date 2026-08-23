@@ -13,13 +13,16 @@ import (
 
 	"socmem/internal/ch"
 	"socmem/internal/config"
+	"socmem/internal/embed"
 	"socmem/internal/entity"
+	"socmem/internal/memory"
 )
 
 // itestBoth wires the full projection stack against live services: fresh
-// Dgraph data, an empty mem.entities, and epoch watermarks. Tests seeded
-// after this get exact global counts because the suite runs package binaries
-// serially (make itest -p 1) and nothing else writes these tables.
+// Dgraph data, empty mem.entities and mem.edges, and epoch watermarks.
+// Tests seeded after this get exact global counts because the suite runs
+// package binaries serially (make itest -p 1) and nothing else writes these
+// tables.
 func itestBoth(t *testing.T) (*Store, driver.Conn) {
 	t.Helper()
 	if os.Getenv("MEM_TEST_CH_ADDR") == "" {
@@ -44,9 +47,11 @@ func itestBoth(t *testing.T) (*Store, driver.Conn) {
 	if err := ch.Migrate(ctx, conn, cfg); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if err := conn.Exec(ctx,
-		"ALTER TABLE mem.entities DELETE WHERE 1 SETTINGS mutations_sync = 1"); err != nil {
-		t.Fatalf("wipe mem.entities: %v", err)
+	for _, table := range []string{"mem.entities", "mem.edges"} {
+		if err := conn.Exec(ctx,
+			"ALTER TABLE "+table+" DELETE WHERE 1 SETTINGS mutations_sync = 1"); err != nil {
+			t.Fatalf("wipe %s: %v", table, err)
+		}
 	}
 	for _, name := range []string{watermarkEntities, watermarkEdges} {
 		if err := conn.Exec(ctx,
@@ -57,6 +62,14 @@ func itestBoth(t *testing.T) (*Store, driver.Conn) {
 		}
 	}
 	return s, conn
+}
+
+// edgeService builds the real memory write path (facts + edges) over the
+// test connection so projection exercises actual writer behavior, never
+// raw inserts.
+func edgeService(t *testing.T, conn driver.Conn) *memory.Service {
+	t.Helper()
+	return memory.New(conn, entity.NewResolver(conn), embed.NewFake(8), config.Load())
 }
 
 // seedEntity resolves one raw value into mem.entities. The sleep keeps each
@@ -116,12 +129,12 @@ func fetchNodes(t *testing.T, s *Store, ctx context.Context, chIDs ...string) ma
 	return out
 }
 
-// readWatermarkValue reads the entities cursor directly from ClickHouse.
-func readWatermarkValue(t *testing.T, ctx context.Context, conn driver.Conn) time.Time {
+// readWatermarkValue reads one named cursor's ts directly from ClickHouse.
+func readWatermarkValue(t *testing.T, ctx context.Context, conn driver.Conn, name string) time.Time {
 	t.Helper()
 	var ts time.Time
 	if err := conn.QueryRow(ctx,
-		"SELECT max(ts) FROM mem.projection_watermark WHERE name = 'entities'").Scan(&ts); err != nil {
+		"SELECT max(ts) FROM mem.projection_watermark WHERE name = ?", name).Scan(&ts); err != nil {
 		t.Fatalf("read watermark: %v", err)
 	}
 	return ts
@@ -275,7 +288,7 @@ func TestProjectEntitiesBatchBoundary(t *testing.T) {
 		t.Fatalf("expected 3 seeded entities, got %d (%v)", len(ordered), ordered)
 	}
 
-	wmPrev := readWatermarkValue(t, ctx, conn)
+	wmPrev := readWatermarkValue(t, ctx, conn, watermarkEntities)
 	type step struct {
 		wantN int
 		want  []string // ch_ids expected present after this call
@@ -293,7 +306,7 @@ func TestProjectEntitiesBatchBoundary(t *testing.T) {
 		if n != stp.wantN {
 			t.Errorf("step %d wrote %d nodes, want %d", i, n, stp.wantN)
 		}
-		wmNow := readWatermarkValue(t, ctx, conn)
+		wmNow := readWatermarkValue(t, ctx, conn, watermarkEntities)
 		if wmNow.Before(wmPrev) {
 			t.Errorf("step %d rewound watermark: %v -> %v", i, wmPrev, wmNow)
 		}
@@ -323,4 +336,227 @@ func hasString(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// relatedEdgeView is one outgoing related_to target of a node. Dgraph
+// returns per-edge facets as sibling keys ON THE TARGET OBJECT (e.g.
+// "related_to|relation"), not on the parent node.
+type relatedEdgeView struct {
+	Uid            string `json:"uid"`
+	ChID           string `json:"ch_id"`
+	FacetRelation  string `json:"related_to|relation"`
+	FacetValidFrom string `json:"related_to|valid_from"`
+	FacetValidTo   string `json:"related_to|valid_to"`
+}
+
+// outgoingView is the projected subj node plus its outgoing edges.
+type outgoingView struct {
+	Uid       string            `json:"uid"`
+	RelatedTo []relatedEdgeView `json:"related_to"`
+}
+
+// fetchOutgoing returns the projected view of one ch_id's node, including
+// its outgoing related_to edges and facets. A missing node yields ok=false.
+func fetchOutgoing(t *testing.T, s *Store, ctx context.Context, chID string) (outgoingView, bool) {
+	t.Helper()
+	q := fmt.Sprintf(
+		`{ q(func: eq(ch_id, %q)) { uid related_to @facets(relation, valid_from, valid_to) { uid ch_id } } }`,
+		chID)
+	resp, err := s.Dgraph().NewReadOnlyTxn().Query(ctx, q)
+	if err != nil {
+		t.Fatalf("fetch outgoing of %s: %v", chID, err)
+	}
+	var parsed struct {
+		Q []outgoingView `json:"q"`
+	}
+	if err := json.Unmarshal(resp.Json, &parsed); err != nil {
+		t.Fatalf("decode outgoing response %s: %v", resp.Json, err)
+	}
+	if len(parsed.Q) == 0 {
+		return outgoingView{}, false
+	}
+	return parsed.Q[0], true
+}
+
+// assertFactWithObject asserts an active human fact carrying an object
+// endpoint through the REAL writer, minting the mem.edges row.
+func assertFactWithObject(t *testing.T, svc *memory.Service, scope, subjectID, predicate, objectValue, objectID string) memory.Fact {
+	t.Helper()
+	f, err := svc.AssertFact(context.Background(), memory.FactInput{
+		Scope:       scope,
+		SubjectID:   subjectID,
+		Predicate:   predicate,
+		ObjectValue: objectValue,
+		ObjectID:    objectID,
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-edge-test",
+	})
+	if err != nil {
+		t.Fatalf("assert fact %s/%s: %v", predicate, objectValue, err)
+	}
+	if f.Status != memory.Active {
+		t.Fatalf("fact %s status = %s, want active", f.ID, f.Status)
+	}
+	return f
+}
+
+func TestProjectEdges(t *testing.T) {
+	ctx := itestCtx(t)
+	s, conn := itestBoth(t)
+
+	scope := fmt.Sprintf("itest-edges-%x", time.Now().UnixNano())
+	svc := edgeService(t, conn)
+
+	eSubj := seedEntity(t, ctx, conn, scope, "c2.beacon.example")
+	eObj1 := seedEntity(t, ctx, conn, scope, "198.51.100.9")
+	eObj2 := seedEntity(t, ctx, conn, scope, "198.51.100.10")
+
+	if n, err := ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
+		t.Fatalf("ProjectEntities = (%d, %v), want (3, nil)", n, err)
+	}
+
+	// Open-edge projection: the activated fact's edge appears with facets.
+	f1 := assertFactWithObject(t, svc, scope, eSubj.EntityID, "communicates_with", "c2", eObj1.EntityID)
+	n, err := ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("ProjectEdges: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("first edge projection processed %d rows, want 1", n)
+	}
+	out, ok := fetchOutgoing(t, s, ctx, eSubj.EntityID)
+	if !ok || len(out.RelatedTo) != 1 {
+		t.Fatalf("projected edge missing after first projection: %+v (ok=%v)", out, ok)
+	}
+	if got := out.RelatedTo[0].ChID; got != eObj1.EntityID {
+		t.Errorf("edge target ch_id = %s, want %s", got, eObj1.EntityID)
+	}
+	edge := out.RelatedTo[0]
+	if edge.FacetRelation != "communicates_with" {
+		t.Errorf("relation facet = %q, want communicates_with", edge.FacetRelation)
+	}
+	vf, err := time.Parse(time.RFC3339, edge.FacetValidFrom)
+	if err != nil {
+		t.Fatalf("parse valid_from facet %q: %v", edge.FacetValidFrom, err)
+	}
+	if vf.Unix() != f1.ValidFrom.Truncate(time.Second).Unix() {
+		t.Errorf("valid_from facet = %v, want ~%v", vf, f1.ValidFrom)
+	}
+	if vt, perr := time.Parse(time.RFC3339, edge.FacetValidTo); perr != nil || vt.Year() < 2100 {
+		t.Errorf("valid_to facet = %q (err=%v), want open-ended sentinel", edge.FacetValidTo, perr)
+	}
+
+	// Supersede path through the REAL writer: asserting a new value for the
+	// same (scope, subject, predicate) closes the prior edge via mutation —
+	// which MOVES updated_at (migration 003), so the projector whose cursor
+	// already passed the original insert still sees the closure. Both rows
+	// process in one call: old closed -> delete triple, new open -> set.
+	time.Sleep(1100 * time.Millisecond)
+	f2 := assertFactWithObject(t, svc, scope, eSubj.EntityID, "communicates_with", "benign-parked", eObj2.EntityID)
+	n, err = ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("supersede ProjectEdges: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("supersede projection processed %d rows, want 2 (closed prior + new)", n)
+	}
+	out, _ = fetchOutgoing(t, s, ctx, eSubj.EntityID)
+	if len(out.RelatedTo) != 1 {
+		t.Fatalf("after supersede outgoing = %+v, want exactly the new link", out)
+	}
+	if got := out.RelatedTo[0].ChID; got != eObj2.EntityID {
+		t.Errorf("after supersede target = %s, want %s (old link gone, new present)", got, eObj2.EntityID)
+	}
+	if out.RelatedTo[0].FacetRelation != "communicates_with" {
+		t.Errorf("after supersede relation facet = %q", out.RelatedTo[0].FacetRelation)
+	}
+
+	// Retract path through the REAL writer: RetractFact fires
+	// closeEdgesByFromFact, bumping updated_at on the closed row; the next
+	// projection deletes the triple outright.
+	if _, err := svc.RetractFact(ctx, f2.ID, "false positive", "human", "analyst-edge-test"); err != nil {
+		t.Fatalf("retract: %v", err)
+	}
+	n, err = ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("retract ProjectEdges: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("retract projection processed %d rows, want 1", n)
+	}
+	out, _ = fetchOutgoing(t, s, ctx, eSubj.EntityID)
+	if len(out.RelatedTo) != 0 {
+		t.Fatalf("edge still present after retraction: %+v", out)
+	}
+
+	// Drained replay: nothing new, nothing written.
+	n, err = ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("drained ProjectEdges: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("drained replay processed %d rows, want 0", n)
+	}
+}
+
+func TestProjectEdgesBatch(t *testing.T) {
+	ctx := itestCtx(t)
+	s, conn := itestBoth(t)
+
+	scope := fmt.Sprintf("itest-edgebatch-%x", time.Now().UnixNano())
+	svc := edgeService(t, conn)
+
+	eSubj := seedEntity(t, ctx, conn, scope, "198.51.100.21")
+	eObj1 := seedEntity(t, ctx, conn, scope, "T1059")
+	eObj2 := seedEntity(t, ctx, conn, scope, "203.0.113.31")
+	all := []string{eSubj.EntityID, eObj1.EntityID, eObj2.EntityID}
+
+	if n, err := ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
+		t.Fatalf("ProjectEntities = (%d, %v), want (3, nil)", n, err)
+	}
+
+	// Two projectable edges: distinct predicates so neither supersedes the
+	// other. Each mints one open mem.edges row via the real writer.
+	assertFactWithObject(t, svc, scope, eSubj.EntityID, "communicates_with", "x", eObj1.EntityID)
+	assertFactWithObject(t, svc, scope, eSubj.EntityID, "resolves_to", "y", eObj2.EntityID)
+
+	// Third edge whose dst entity deliberately has NO projected node:
+	// the projector must skip it (never dangling-create) AND still advance
+	// the cursor past it, or batch progression wedges forever.
+	eLate := seedEntity(t, ctx, conn, scope, "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855")
+	assertFactWithObject(t, svc, scope, eSubj.EntityID, "drops", "z", eLate.EntityID)
+
+	wmPrev := readWatermarkValue(t, ctx, conn, watermarkEdges)
+	for i, wantN := range []int{1, 1, 1, 0} {
+		n, err := ProjectEdges(ctx, s, conn, 1)
+		if err != nil {
+			t.Fatalf("step %d: ProjectEdges: %v", i, err)
+		}
+		if n != wantN {
+			t.Errorf("step %d processed %d rows, want %d", i, n, wantN)
+		}
+		wmNow := readWatermarkValue(t, ctx, conn, watermarkEdges)
+		if wmNow.Before(wmPrev) {
+			t.Errorf("step %d rewound watermark: %v -> %v", i, wmPrev, wmNow)
+		}
+		wmPrev = wmNow
+	}
+
+	nodes := fetchNodes(t, s, ctx, all...)
+	if len(nodes) != 3 {
+		t.Fatalf("node count = %d, want 3 (skip path must not create nodes)", len(nodes))
+	}
+	out, ok := fetchOutgoing(t, s, ctx, eSubj.EntityID)
+	if !ok || len(out.RelatedTo) != 2 {
+		t.Fatalf("outgoing after batch drain = %+v, want 2 links", out)
+	}
+	targets := map[string]bool{}
+	for _, r := range out.RelatedTo {
+		targets[r.ChID] = true
+	}
+	if !targets[eObj1.EntityID] || !targets[eObj2.EntityID] {
+		t.Errorf("targets %v missing expected endpoints %s / %s",
+			targets, eObj1.EntityID, eObj2.EntityID)
+	}
 }

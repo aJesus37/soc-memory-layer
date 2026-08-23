@@ -1,34 +1,43 @@
 package graph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/dgraph-io/dgo/v250"
 	"github.com/dgraph-io/dgo/v250/protos/api"
+	"github.com/google/uuid"
 )
 
 const (
-	// watermarkEntities is the mem.projection_watermark row driving
-	// ProjectEntities; watermarkEdges belongs to Task 7.
+	// watermarkEntities / watermarkEdges are the mem.projection_watermark
+	// rows driving ProjectEntities and ProjectEdges respectively.
 	watermarkEntities = "entities"
 	watermarkEdges    = "edges"
 
 	defaultBatch = 500
 
-	// nilEntityID stands in for "no tiebreaker yet" when binding the epoch
-	// cursor: entity_id is a UUID column, so the tuple comparison needs a
-	// parseable value that sorts before every real id.
-	nilEntityID = "00000000-0000-0000-0000-000000000000"
+	// nilUUID stands in for "no tiebreaker yet" when binding the epoch
+	// cursor: both id tiebreakers are UUID columns, so the tuple comparison
+	// needs a parseable value that sorts before every real id.
+	nilUUID = "00000000-0000-0000-0000-000000000000"
 
 	entityPageQuery = "SELECT entity_id, scope, entity_type, key, display_name, " +
 		"first_seen, last_seen, updated_at FROM mem.entities FINAL " +
 		"WHERE (updated_at, entity_id) > (?, ?) " +
 		"ORDER BY updated_at ASC, entity_id ASC LIMIT ?"
+
+	edgePageQuery = "SELECT edge_id, scope, src_id, dst_id, relation, from_fact, " +
+		"valid_from, valid_to, updated_at FROM mem.edges " +
+		"WHERE (updated_at, edge_id) > (?, ?) " +
+		"ORDER BY updated_at ASC, edge_id ASC LIMIT ?"
 )
 
 // ProjectEntities projects mem.entities rows newer than the stored watermark
@@ -76,9 +85,9 @@ func ProjectEntities(ctx context.Context, st *Store, conn driver.Conn, batch int
 		return 0, err
 	}
 	if lastID == "" {
-		lastID = nilEntityID
+		lastID = nilUUID
 	}
-	page, err := queryEntityRows(ctx, conn, formatCHTimestamp(ts), lastID, batch)
+	page, err := queryEntityRows(ctx, conn, ts, lastID, batch)
 	if err != nil {
 		return 0, err
 	}
@@ -91,11 +100,10 @@ func ProjectEntities(ctx context.Context, st *Store, conn driver.Conn, batch int
 		return 0, nil
 	}
 	last := page[len(page)-1]
-	stamp := formatCHTimestamp(last.UpdatedAt)
 	if exists {
-		err = updateCursor(ctx, conn, watermarkEntities, stamp, last.EntityID)
+		err = updateCursor(ctx, conn, watermarkEntities, last.UpdatedAt, last.EntityID)
 	} else {
-		err = seedCursor(ctx, conn, watermarkEntities, stamp, last.EntityID)
+		err = seedCursor(ctx, conn, watermarkEntities, last.UpdatedAt, last.EntityID)
 	}
 	if err != nil {
 		return 0, err
@@ -116,8 +124,8 @@ type chEntity struct {
 	UpdatedAt   time.Time
 }
 
-func queryEntityRows(ctx context.Context, conn driver.Conn, ts, lastID string, batch int) ([]chEntity, error) {
-	rows, err := conn.Query(ctx, entityPageQuery, ts, lastID, batch)
+func queryEntityRows(ctx context.Context, conn driver.Conn, ts time.Time, lastID string, batch int) ([]chEntity, error) {
+	rows, err := conn.Query(ctx, entityPageQuery, formatCHTimestamp(ts), lastID, batch)
 	if err != nil {
 		return nil, fmt.Errorf("graph: query entities: %w", err)
 	}
@@ -211,27 +219,252 @@ func readCursor(ctx context.Context, conn driver.Conn, name string) (time.Time, 
 }
 
 // seedCursor creates a missing watermark row at the given position.
-func seedCursor(ctx context.Context, conn driver.Conn, name, ts, lastID string) error {
+func seedCursor(ctx context.Context, conn driver.Conn, name string, ts time.Time, lastID string) error {
 	if err := conn.Exec(ctx,
 		"INSERT INTO mem.projection_watermark (name, ts, last_id) VALUES (?, ?, ?)",
-		name, ts, lastID); err != nil {
+		name, formatCHTimestamp(ts), lastID); err != nil {
 		return fmt.Errorf("graph: seed %s watermark: %w", name, err)
 	}
 	return nil
 }
 
 // updateCursor advances the watermark synchronously (mutations_sync=1) so a
-// returned error always means the old cursor still stands.
-func updateCursor(ctx context.Context, conn driver.Conn, name, ts, lastID string) error {
+// returned error always means the old cursor still stands. The WHERE clause
+// is a compare-and-set — (ts, last_id) < (?, ?) in the same composite order
+// the page query sorts by — so an overlapping caller (double-scheduled
+// worker, manual replay racing a live tick) can never move the cursor
+// backwards; a stale writer's UPDATE matches zero rows and changes nothing.
+func updateCursor(ctx context.Context, conn driver.Conn, name string, ts time.Time, lastID string) error {
+	stamp := formatCHTimestamp(ts)
 	if err := conn.Exec(ctx,
-		"ALTER TABLE mem.projection_watermark UPDATE ts = ?, last_id = ? WHERE name = ? "+
+		"ALTER TABLE mem.projection_watermark UPDATE ts = ?, last_id = ? "+
+			"WHERE name = ? AND (ts, last_id) < (?, ?) "+
 			"SETTINGS mutations_sync = 1",
-		ts, lastID, name); err != nil {
+		stamp, lastID, name, stamp, lastID); err != nil {
 		return fmt.Errorf("graph: advance %s watermark: %w", name, err)
 	}
 	return nil
 }
 
+// formatCHTimestamp renders a cursor timestamp for binding against a
+// DateTime64(3) column.
+//
+// DELIBERATE STRING BINDING — do not "fix" this to pass time.Time directly:
+// clickhouse-go v2.48 renders bare time.Time bind parameters at SECOND
+// precision (and typed {p:DateTime64(3)} placeholders degrade to lossy
+// epoch-fraction casts), so any direct binding silently truncates the
+// milliseconds the composite cursor depends on. Probed empirically: a
+// .123 watermark round-tripped through both binding styles came back .000
+// / .600, which makes keyset pagination re-read whole seconds of rows
+// forever. An explicitly formatted "2006-01-02 15:04:05.000" literal is
+// cast server-side with full millisecond fidelity; the read path (Scan
+// into time.Time) preserves ms regardless.
 func formatCHTimestamp(ts time.Time) string {
 	return ts.UTC().Format("2006-01-02 15:04:05.000")
+}
+
+// ProjectEdges projects mem.edges changes into Dgraph related_to edges with
+// facets. Open edges (valid_to in the future) upsert the src->dst triple
+// with relation/valid_from/valid_to facets; closed edges (valid_to <= now)
+// delete the triple. It returns the number of edge rows processed this call
+// (including rows skipped for a missing endpoint node); batch bounds the
+// page size; values <= 0 select defaultBatch.
+//
+// # MODELING CONSTRAINT: one relation per (src,dst) pair
+//
+// All relations share the single related_to predicate, so an ordered
+// (src,dst) pair carries AT MOST ONE live relation: two different facts
+// linking the same pair overwrite each other's facets at projection time,
+// whichever projects later wins, and closing one of the two deletes the
+// shared triple even if its sibling is still open — deletion is per-triple,
+// not per-facet-set. Acceptable Phase-2 scope (hunts care about
+// connectivity plus one verdict-style label); revisit with per-relation
+// predicates if hunts ever need parallel relations on one pair.
+//
+// Watermark invariant: identical composite-cursor mechanics as
+// ProjectEntities — pages read WHERE (updated_at, edge_id) > (?, ?) in a
+// deterministic total order; the cursor advances to the last row only after
+// the Dgraph write commits; any earlier error returns before advancement
+// and replays the page harmlessly.
+//
+// Closure visibility is what makes this correct at all: mem.edges closures
+// are MUTATIONS that leave the row physically in place, so the writers bump
+// updated_at alongside valid_to (migration 003), turning every closure into
+// a fresh position in the pagination order that a cursor which already
+// passed the original insert can still see.
+//
+// Rows whose endpoints have no projected node (ProjectEntities lagging) are
+// skipped with a debug log and NOT retried — the cursor moves past them;
+// the next touch of the underlying fact re-mints or re-closes the edge row
+// and it re-enters the order. Retry-duplicated edge rows converge:
+// replaying an open edge re-sets the identical triple and facets.
+func ProjectEdges(ctx context.Context, st *Store, conn driver.Conn, batch int) (int, error) {
+	if batch <= 0 {
+		batch = defaultBatch
+	}
+	if st == nil || conn == nil {
+		return 0, errors.New("graph: project edges: nil store or connection")
+	}
+
+	ts, lastID, exists, err := readCursor(ctx, conn, watermarkEdges)
+	if err != nil {
+		return 0, err
+	}
+	if lastID == "" {
+		lastID = nilUUID
+	}
+	page, err := queryEdgeRows(ctx, conn, ts, lastID, batch)
+	if err != nil {
+		return 0, err
+	}
+	if len(page) == 0 {
+		return 0, nil
+	}
+	if err := applyEdgePage(ctx, st.Dgraph(), page); err != nil {
+		return 0, err
+	}
+	last := page[len(page)-1]
+	lastID = last.EdgeID.String()
+	if exists {
+		err = updateCursor(ctx, conn, watermarkEdges, last.UpdatedAt, lastID)
+	} else {
+		err = seedCursor(ctx, conn, watermarkEdges, last.UpdatedAt, lastID)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(page), nil
+}
+
+// chEdge is one mem.edges row exactly as needed for projection. Edges are
+// a plain MergeTree (no FINAL): every physical row is distinct — supersede
+// and retract close rows via mutation, never via replacement versions.
+type chEdge struct {
+	EdgeID    uuid.UUID
+	Scope     string
+	SrcID     uuid.UUID
+	DstID     uuid.UUID
+	Relation  string
+	FromFact  uuid.UUID
+	ValidFrom time.Time
+	ValidTo   time.Time
+	UpdatedAt time.Time
+}
+
+func queryEdgeRows(ctx context.Context, conn driver.Conn, ts time.Time, lastID string, batch int) ([]chEdge, error) {
+	rows, err := conn.Query(ctx, edgePageQuery, formatCHTimestamp(ts), lastID, batch)
+	if err != nil {
+		return nil, fmt.Errorf("graph: query edges: %w", err)
+	}
+	defer rows.Close()
+	var out []chEdge
+	for rows.Next() {
+		var e chEdge
+		if err := rows.Scan(&e.EdgeID, &e.Scope, &e.SrcID, &e.DstID, &e.Relation,
+			&e.FromFact, &e.ValidFrom, &e.ValidTo, &e.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("graph: scan edge row: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("graph: iterate edge rows: %w", err)
+	}
+	return out, nil
+}
+
+// applyEdgePage applies one page as a single atomic Dgraph transaction:
+// all SET nquads (open edges) plus all DELETE nquads (closed edges) commit
+// together or not at all, so a crash mid-page replays the whole page.
+//
+// Endpoints resolve by ch_id in ONE batched eq() lookup — nodes MUST
+// already exist via ProjectEntities; missing endpoints are logged at debug
+// level and skipped (never created dangling). Facets use SINGLE parentheses
+// — the only NQuads facet syntax dgo v250 accepts (double parens fail with
+// "Invalid input: )" at lex time, re-verified against live Dgraph v25) —
+// with quoted string values carrying RFC3339 timestamps that read back
+// verbatim under @facets sub-selections.
+func applyEdgePage(ctx context.Context, c *dgo.Dgraph, page []chEdge) error {
+	uids, err := resolveNodeUIDs(ctx, c, page)
+	if err != nil {
+		return err
+	}
+
+	var setBuf, delBuf bytes.Buffer
+	now := time.Now()
+	for _, e := range page {
+		srcUID, okSrc := uids[e.SrcID.String()]
+		dstUID, okDst := uids[e.DstID.String()]
+		if !okSrc || !okDst {
+			slog.Debug("graph: skip edge with unprojected endpoint",
+				"edge_id", e.EdgeID,
+				"src_id", e.SrcID,
+				"dst_id", e.DstID,
+				"relation", e.Relation)
+			continue
+		}
+		if e.ValidTo.After(now) {
+			fmt.Fprintf(&setBuf, "<%s> <related_to> <%s> (relation=%q,"+
+				"valid_from=%q,valid_to=%q) .\n",
+				srcUID, dstUID, e.Relation,
+				e.ValidFrom.UTC().Format(time.RFC3339),
+				e.ValidTo.UTC().Format(time.RFC3339))
+		} else {
+			fmt.Fprintf(&delBuf, "<%s> <related_to> <%s> .\n", srcUID, dstUID)
+		}
+	}
+
+	if setBuf.Len() == 0 && delBuf.Len() == 0 {
+		return nil // every row skipped; nothing to mutate
+	}
+	req := &api.Request{CommitNow: true}
+	if setBuf.Len() > 0 {
+		req.Mutations = append(req.Mutations, &api.Mutation{SetNquads: setBuf.Bytes()})
+	}
+	if delBuf.Len() > 0 {
+		req.Mutations = append(req.Mutations, &api.Mutation{DelNquads: delBuf.Bytes()})
+	}
+	txn := c.NewTxn()
+	defer txn.Discard(context.WithoutCancel(ctx))
+	if _, err := txn.Do(ctx, req); err != nil {
+		return fmt.Errorf("graph: apply edge page: %w", err)
+	}
+	return nil
+}
+
+// resolveNodeUIDs maps the ch_id of every src/dst appearing in the page to
+// its projected node's uid, using one indexed eq(ch_id, [...]) lookup.
+func resolveNodeUIDs(ctx context.Context, c *dgo.Dgraph, page []chEdge) (map[string]string, error) {
+	seen := make(map[string]bool)
+	literals := make([]string, 0, 2*len(page))
+	add := func(id uuid.UUID) {
+		s := id.String()
+		if !seen[s] {
+			seen[s] = true
+			literals = append(literals, `"`+s+`"`)
+		}
+	}
+	for _, e := range page {
+		add(e.SrcID)
+		add(e.DstID)
+	}
+
+	q := fmt.Sprintf(`{ res(func: eq(ch_id, [%s])) { uid ch_id } }`, strings.Join(literals, ", "))
+	resp, err := c.NewReadOnlyTxn().Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("graph: resolve edge endpoints: %w", err)
+	}
+	var parsed struct {
+		Res []struct {
+			Uid  string `json:"uid"`
+			ChID string `json:"ch_id"`
+		} `json:"res"`
+	}
+	if err := json.Unmarshal(resp.Json, &parsed); err != nil {
+		return nil, fmt.Errorf("graph: decode edge endpoints response %s: %w", resp.Json, err)
+	}
+	out := make(map[string]string, len(parsed.Res))
+	for _, n := range parsed.Res {
+		out[n.ChID] = n.Uid
+	}
+	return out, nil
 }
