@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 
 	"socmem/internal/ch"
@@ -35,20 +36,20 @@ import (
 // within a scope. Eval files reference keys because ids are unstable across
 // re-seeds.
 func lookupEntityID(conn driver.Conn, scope, key string) (string, bool) {
-	var id string
+	var id uuid.UUID
 	err := conn.QueryRow(context.Background(),
 		"SELECT entity_id FROM mem.entities FINAL WHERE scope = ? AND key = ? LIMIT 1",
 		scope, key).Scan(&id)
 	if err != nil {
 		return "", false
 	}
-	return id, true
+	return id.String(), true
 }
 
 type query struct {
-	Q                    string   `yaml:"q"`
+	Q                     string   `yaml:"q"`
 	MustReferenceEntities []string `yaml:"must_reference_entities"`
-	K                    int      `yaml:"k"`
+	K                     int      `yaml:"k"`
 }
 
 type evalFile struct {
@@ -111,8 +112,9 @@ func main() {
 					hitSet[id] = true
 				}
 			}
-			// Empty must_reference_entities = smoke query: passes if search runs.
-			passed := len(q.MustReferenceEntities) == 0
+			// All referenced entities must surface in top-k. An empty list
+			// is a smoke query: passes if search runs without error.
+			passed := true
 			for _, want := range q.MustReferenceEntities {
 				eid, ok := lookupEntityID(conn, ef.Scope, want)
 				if !ok || !hitSet[eid] {
