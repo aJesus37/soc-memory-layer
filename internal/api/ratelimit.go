@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+// maxLimiterEntries bounds the bucket map: distinct X-Actor-IDs beyond this
+// cap evict the least-recently-seen entry instead of growing memory without
+// bound (a spoofed-header flood would otherwise allocate one bucket per id).
+// A linear scan for the oldest entry is fine at this size.
+const maxLimiterEntries = 10_000
+
 // tokenBucket is one agent's allowance. Capacity equals burst (= rps), so an
 // idle agent may fire a short burst before throttling begins.
 type tokenBucket struct {
@@ -38,6 +44,9 @@ func (l *agentLimiter) allow(actorID string, now time.Time) (bool, time.Duration
 	defer l.mu.Unlock()
 	b, ok := l.buckets[actorID]
 	if !ok {
+		if len(l.buckets) >= maxLimiterEntries {
+			l.evictOldestLocked()
+		}
 		b = &tokenBucket{tokens: l.rps, last: now}
 		l.buckets[actorID] = b
 	}
@@ -52,6 +61,24 @@ func (l *agentLimiter) allow(actorID string, now time.Time) (bool, time.Duration
 	}
 	deficit := (1 - b.tokens) / l.rps
 	return false, time.Duration(deficit * float64(time.Second))
+}
+
+// evictOldestLocked drops the least-recently-seen bucket, making room for a
+// new id at capacity. Caller must hold l.mu.
+func (l *agentLimiter) evictOldestLocked() {
+	var (
+		oldestID string
+		oldestAt time.Time
+		found    bool
+	)
+	for id, b := range l.buckets {
+		if !found || b.last.Before(oldestAt) {
+			oldestID, oldestAt, found = id, b.last, true
+		}
+	}
+	if found {
+		delete(l.buckets, oldestID)
+	}
 }
 
 // writeLimit applies the per-agent budget to write endpoints. Identity

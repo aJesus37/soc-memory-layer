@@ -10,6 +10,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
+	"socmem/internal/ch"
 	"socmem/internal/config"
 	"socmem/internal/memory"
 )
@@ -80,8 +81,11 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 }
 
 // mapServiceError translates service-layer sentinels into HTTP semantics.
-// Anything unrecognized is 400: the service validates its own inputs, so a
-// non-sentinel error is by definition a bad request from this API's side.
+// Wrapped ClickHouse driver faults are 502 storage_error with a generic
+// message — they are not the caller's fault and must not leak driver text.
+// Anything else unrecognized is 400: the service validates its own inputs,
+// so a non-sentinel error is by definition a bad request from this API's
+// side.
 func mapServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, memory.ErrHumanGated):
@@ -91,6 +95,9 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "fact_not_found", err.Error())
 	case errors.Is(err, memory.ErrConflict):
 		writeErr(w, http.StatusConflict, "conflict", err.Error())
+	case ch.IsStorageError(err):
+		writeErr(w, http.StatusBadGateway, "storage_error",
+			"storage temporarily unavailable")
 	default:
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 	}
