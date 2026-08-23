@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ const timelineSubjectsCap = 200
 // Ts=valid_from, Kind="fact:<predicate>" and ActorID=written_by — an honest
 // union of both sources without schema changes.
 type Event struct {
+	ID      string // stable row identity: obs_id or fact_id
 	Ts      time.Time
 	Source  string // "observation" | "fact"
 	Kind    string // observation kind, or "fact:<predicate>"
@@ -60,9 +62,13 @@ const timelineObsProjection = "ts, 'observation' AS src, toString(kind) AS kind,
 // practice; timelineSubjectsCap caps the resulting IN list anyway. An empty
 // subject set skips the facts leg entirely.
 //
-// Ordering is fully deterministic: ts DESC, then source ASC, then text ASC
-// as tie-breakers (DateTime second granularity makes ties possible). LIMIT/
-// OFFSET apply AFTER union+order via subquery wrap.
+// Ordering is fully deterministic: ts DESC, then source ASC, then text ASC,
+// then row id ASC as the final tie-breaker (DateTime second granularity and
+// retry-duplicated rows make full ties reachable, and OFFSET pagination
+// requires a total order to avoid skipping/duplicating tied rows across
+// pages). LIMIT/OFFSET apply AFTER union+order via subquery wrap. Note that
+// offset pagination can shift under concurrent inserts between pages —
+// inherent to OFFSET; keyset pagination is future work if that bites.
 //
 // Consistency: the by-case path reads observations (for subjects) and the
 // union in two sequential statements, so a concurrent write can yield a
@@ -92,13 +98,14 @@ func (s *Service) Timeline(ctx context.Context, scope, caseID, entityID string, 
 			return nil, fmt.Errorf("memory: invalid entity id %q", entityID)
 		}
 		obsLeg := fmt.Sprintf(
-			"SELECT "+timelineObsProjection+" FROM mem.observations "+
+			"SELECT obs_id AS id, "+timelineObsProjection+" FROM mem.observations "+
 				"WHERE scope = ? AND hasAny(entity_refs, [toUUID(?)])",
 			maxExcerptRunes)
-		factLeg := "SELECT valid_from AS ts, 'fact' AS src, concat('fact:', predicate) AS kind, " +
+		factLeg := "SELECT fact_id AS id, valid_from AS ts, 'fact' AS src, concat('fact:', predicate) AS kind, " +
 			"written_by AS actor_id, concat(predicate, ': ', object_value) AS txt " +
 			"FROM mem.facts FINAL WHERE scope = ? AND subject_id = ? AND status != 'retracted'"
 		return s.timelineUnion(ctx,
+			fmt.Sprintf("entity %s scope %q", entityID, scope),
 			obsLeg, []any{scope, entU},
 			factLeg, []any{scope, entU},
 			limit, offset)
@@ -114,16 +121,18 @@ func (s *Service) Timeline(ctx context.Context, scope, caseID, entityID string, 
 		return nil, err
 	}
 	obsLeg := fmt.Sprintf(
-		"SELECT "+timelineObsProjection+" FROM mem.observations "+
+		"SELECT obs_id AS id, "+timelineObsProjection+" FROM mem.observations "+
 			"WHERE scope = ? AND case_id = ?",
 		maxExcerptRunes)
 	obsArgs := []any{scope, caseU}
 	if len(subjects) == 0 {
 		// No linked entities → nothing can bridge to facts; observations only.
-		return s.timelineOrdered(ctx, obsLeg, obsArgs, limit, offset)
+		return s.timelineOrdered(ctx,
+			fmt.Sprintf("case %s scope %q", caseID, scope),
+			obsLeg, obsArgs, limit, offset)
 	}
 	ph := strings.TrimSuffix(strings.Repeat("toUUID(?), ", len(subjects)), ", ")
-	factLeg := "SELECT valid_from AS ts, 'fact' AS src, concat('fact:', predicate) AS kind, " +
+	factLeg := "SELECT fact_id AS id, valid_from AS ts, 'fact' AS src, concat('fact:', predicate) AS kind, " +
 		"written_by AS actor_id, concat(predicate, ': ', object_value) AS txt " +
 		"FROM mem.facts FINAL WHERE scope = ? AND subject_id IN (" + ph + ") " +
 		"AND status != 'retracted'"
@@ -132,7 +141,9 @@ func (s *Service) Timeline(ctx context.Context, scope, caseID, entityID string, 
 	for _, su := range subjects {
 		factArgs = append(factArgs, su)
 	}
-	return s.timelineUnion(ctx, obsLeg, obsArgs, factLeg, factArgs, limit, offset)
+	return s.timelineUnion(ctx,
+		fmt.Sprintf("case %s scope %q", caseID, scope),
+		obsLeg, obsArgs, factLeg, factArgs, limit, offset)
 }
 
 // timelineCaseSubjects collects the distinct entity ids referenced by ALL
@@ -167,6 +178,9 @@ func (s *Service) timelineCaseSubjects(ctx context.Context, scope string, caseID
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("memory: timeline iterate subject refs case %s: %w", caseID, err)
 	}
+	// Deterministic cap order: pages must agree on WHICH subjects survive
+	// truncation, so sort by canonical string form before slicing.
+	sort.Slice(subs, func(i, j int) bool { return subs[i].String() < subs[j].String() })
 	if len(subs) > timelineSubjectsCap {
 		subs = subs[:timelineSubjectsCap]
 	}
@@ -176,39 +190,39 @@ func (s *Service) timelineCaseSubjects(ctx context.Context, scope string, caseID
 // timelineUnion wraps the two legs in a subquery, orders the merged result
 // deterministically and paginates AFTER union+order. Args must arrive
 // obs-leg first, facts-leg second, matching leg placement in the UNION.
-func (s *Service) timelineUnion(ctx context.Context, obsLeg string, obsArgs []any, factLeg string, factArgs []any, limit, offset int) ([]Event, error) {
-	q := "SELECT ts, src, kind, actor_id, txt FROM (" +
+func (s *Service) timelineUnion(ctx context.Context, label string, obsLeg string, obsArgs []any, factLeg string, factArgs []any, limit, offset int) ([]Event, error) {
+	q := "SELECT id, ts, src, kind, actor_id, txt FROM (" +
 		obsLeg + " UNION ALL " + factLeg + ")" +
-		fmt.Sprintf(" ORDER BY ts DESC, src ASC, txt ASC LIMIT %d OFFSET %d", limit, offset)
+		fmt.Sprintf(" ORDER BY ts DESC, src ASC, txt ASC, id ASC LIMIT %d OFFSET %d", limit, offset)
 	args := append(append([]any{}, obsArgs...), factArgs...)
-	return s.scanTimeline(ctx, q, args)
+	return s.scanTimeline(ctx, label, q, args)
 }
 
 // timelineOrdered paginates a single leg (the entity-less by-case path).
-func (s *Service) timelineOrdered(ctx context.Context, leg string, args []any, limit, offset int) ([]Event, error) {
-	q := leg + fmt.Sprintf(" ORDER BY ts DESC, src ASC, txt ASC LIMIT %d OFFSET %d", limit, offset)
-	return s.scanTimeline(ctx, q, args)
+func (s *Service) timelineOrdered(ctx context.Context, label string, leg string, args []any, limit, offset int) ([]Event, error) {
+	q := leg + fmt.Sprintf(" ORDER BY ts DESC, src ASC, txt ASC, id ASC LIMIT %d OFFSET %d", limit, offset)
+	return s.scanTimeline(ctx, label, q, args)
 }
 
-// scanTimeline runs one assembled query and scans its five-column rows.
+// scanTimeline runs one assembled query and scans its six-column rows.
 // Always returns a non-nil slice: an empty timeline is []Event{}, not nil.
-func (s *Service) scanTimeline(ctx context.Context, q string, args []any) ([]Event, error) {
+func (s *Service) scanTimeline(ctx context.Context, label string, q string, args []any) ([]Event, error) {
 	rows, err := s.conn.Query(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("memory: timeline query: %w", err)
+		return nil, fmt.Errorf("memory: timeline query %s: %w", label, err)
 	}
 	defer rows.Close()
 	events := []Event{}
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.Ts, &e.Source, &e.Kind, &e.ActorID, &e.Text); err != nil {
-			return nil, fmt.Errorf("memory: timeline scan: %w", err)
+		if err := rows.Scan(&e.ID, &e.Ts, &e.Source, &e.Kind, &e.ActorID, &e.Text); err != nil {
+			return nil, fmt.Errorf("memory: timeline scan %s: %w", label, err)
 		}
 		e.Ts = e.Ts.UTC()
 		events = append(events, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("memory: timeline iterate: %w", err)
+		return nil, fmt.Errorf("memory: timeline iterate %s: %w", label, err)
 	}
 	return events, nil
 }

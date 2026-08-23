@@ -372,3 +372,104 @@ func TestTimelineValidation(t *testing.T) {
 		t.Errorf("valid by-case arguments must be accepted, got: %v", err)
 	}
 }
+
+func TestTimelineExcludesRetractedFacts(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "retracted.timeline.example.com")
+
+	if _, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "c2",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := s.Timeline(ctx, scope, "", subj.EntityID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Source != "fact" {
+		t.Fatalf("precondition: want exactly the fact event, got %+v", events)
+	}
+
+	if _, err := s.RetractFact(ctx, events[0].ID, "false positive", "human", "analyst-j"); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err = s.Timeline(ctx, scope, "", subj.EntityID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		if e.Source == "fact" {
+			t.Errorf("retracted fact still on timeline: %+v", e)
+		}
+	}
+	if len(events) != 0 {
+		t.Fatalf("timeline should be empty after retracting the only event, got %+v", events)
+	}
+}
+
+func TestTimelineShowsSupersededPriors(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+	subj := mustResolveEntity(t, conn, scope, "superseded.timeline.example.com")
+
+	f1, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "c2",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-j",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond) // distinct valid_from seconds + updated_at ms
+	if _, err := s.AssertFact(ctx, FactInput{
+		Scope:       scope,
+		SubjectID:   subj.EntityID,
+		Predicate:   "verdict_malicious",
+		ObjectValue: "benign-parked",
+		Confidence:  0.9,
+		ActorType:   "human",
+		ActorID:     "analyst-k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = f1
+
+	events, err := s.Timeline(ctx, scope, "", subj.EntityID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range events {
+		if e.Source == "fact" {
+			got = append(got, e.Text)
+		}
+	}
+	// Timeline is newest-first: f2 (benign-parked) was asserted after f1 (c2),
+	// and both versions appear at their own valid_from positions.
+	want := []string{"verdict_malicious: benign-parked", "verdict_malicious: c2"}
+	if len(got) != len(want) {
+		t.Fatalf("want both fact versions on timeline (assertion history), got %v", got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("event %d: got %q want %q", i, got[i], w)
+		}
+	}
+}
