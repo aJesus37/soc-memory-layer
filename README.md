@@ -4,6 +4,10 @@ Shared memory layer for a security operations team: investigations (human +
 agent), alert triage context, and company knowledge — stored in ClickHouse,
 served over HTTP, consumable by analysts and agents alike.
 
+Knowledge is **org-shared by default**: a fact team B asserts about a domain
+is immediately visible (with attribution) when team A enriches that domain.
+`restricted` items stay inside their team. See ADR-010.
+
 **Status:** Phases 1–2 complete — memory core, Dgraph projection, dreaming-lite
 extraction, MCP server. Phase 3: UUIDv7 identifiers, hyphenated-domain
 extraction, full documentation set.

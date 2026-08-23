@@ -26,7 +26,7 @@ first-sight races.
 
 `MergeTree ORDER BY (scope, ts)` · text index (`splitByNonAlpha`) · conditional TTL: alert rows expire after 365 days (eventual, on merge)
 
-obs_id UUID (UUIDv7 going forward; ClientEventID retries reuse it and create a second physical row — plain MergeTree never dedups) · kind Enum8(alert, triage_decision, investigation_note, hunt_finding, agent_action, human_statement) · actor_type/actor_id/on_behalf_of attribution · case_id Nullable(UUID) · confidentiality Enum8(internal, restricted) · content String · content_vec Array(Float32) — empty when embedding unavailable · entity_refs Array(UUID)
+obs_id UUID (UUIDv7 going forward; ClientEventID retries reuse it and create a second physical row — plain MergeTree never dedups) · kind Enum8(alert, triage_decision, investigation_note, hunt_finding, agent_action, human_statement) · actor_type/actor_id/on_behalf_of attribution · case_id Nullable(UUID) · confidentiality Enum8(internal, restricted) — internal = readable org-wide (default), restricted = originating scope ONLY (enforced on every observation read since ADR-010) · content String · content_vec Array(Float32) — empty when embedding unavailable · entity_refs Array(UUID)
 
 ### `facts` — distilled semantic layer
 
@@ -34,7 +34,7 @@ obs_id UUID (UUIDv7 going forward; ClientEventID retries reuse it and create a s
 
 fact_id UUID (new per version) · status Enum8(proposed, active, retracted) DEFAULT 'active' — **always written explicitly** (fail-open column default) · confidence Float32 (clamped [0,1], NaN→0) · source_obs UUID → provenance to the observation that caused it · valid_from / valid_to DateTime (sentinel 2105-12-31; bounded because '9999' silently wraps in UInt32-backed DateTime)
 
-Read path: `FINAL WHERE status='active' AND valid_from <= now AND valid_to > now`.
+Read path: `FINAL WHERE status='active' AND valid_from <= now AND valid_to > now AND (scope = caller OR visibility = 'org')` — the last clause implements org-wide sharing (ADR-010).
 
 ### `edges` — graph source-of-truth rows
 
@@ -86,8 +86,9 @@ after all v7 ids — monotonic cursors remain correct (ADR-007).
 
 ## Invariants worth testing after any change
 
-1. Facts always carry explicit status (column default is fail-open).
+1. Facts always carry explicit status (column default is fail-open) and explicit visibility.
 2. Proposals never close prior active facts; only `active` versions trigger supersede waves.
 3. Audit summaries contain counts/keys/statuses — never observation or fact content.
 4. Edge closure mutations stamp `updated_at`, or closures become invisible to the projector.
-5. Every read query filters `scope`.
+5. Every read query filters visibility: `(scope = caller OR visibility/confidentiality gate)` — restricted content is fully invisible cross-team; by-case timelines stay scope-local.
+6. Entity keys are shared knowledge's join currency: normalization changes (e.g., hyphen handling) alter which rows connect across teams.
