@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+// maxResponseBytes caps model responses; a hostile/broken endpoint must not
+// stream unbounded into memory. 10 MiB dwarfs any legitimate embedding or
+// chat payload.
+const maxResponseBytes = 10 << 20
+
 const (
 	prefixDocument = "search_document: "
 	prefixQuery    = "search_query: "
@@ -107,7 +112,7 @@ func (c *OpenAI) Embed(ctx context.Context, kind string, texts []string) ([][]fl
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("embed: read response: %w", err)
 	}

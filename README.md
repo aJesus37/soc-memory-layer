@@ -99,12 +99,82 @@ leaks to clients). Unknown JSON fields are rejected — typos fail loudly.
 - **Backup:** native ClickHouse backups cover everything (the Phase-2 graph
   projection is rebuildable from `mem.edges`, so it needs none).
 
+## Phase 2 — graph, extraction, MCP
+
+### Dgraph projection (rebuildable)
+
+Entities and open edges project into Dgraph every 5s (watermark cursors in
+`mem.projection_watermark`). ClickHouse stays the sole source of truth — the
+graph can be dropped and replayed at any time:
+
+```bash
+go run ./cmd/graphrebuild            # wipe + replay from mem.entities/mem.edges
+```
+
+Edges carry facets (`relation`, validity window). One relation per ordered
+entity pair (last write wins) — known modeling constraint, revisit if hunting
+needs multi-relational pairs. Traversal filters validity at read time.
+
+**Ops:** monitor Dgraph memory (in-memory indexes); `make db-down` wipes both
+stores; projection lag = watermark ts vs now.
+
+### Dreaming-lite fact extraction
+
+Off by default. Enable with:
+
+```bash
+MEM_EXTRACT_ENABLED=true MEM_EXTRACT_MODEL=qwen/qwen3-8b make run
+```
+
+A worker polls observations lacking fact coverage every 30s, asks the local
+chat model for structured candidate facts, and asserts them as
+`proposed` (actor `extractor-v1`) — except whitelisted predicates
+(`resolved_to` by default) which auto-activate at confidence ≥ floor.
+Coverage lives in `mem.extract_log`; a hostile/garbage model response covers
+the observation and moves on (no wedge). Review proposals via
+`GET /v1/enrich` + human promote/retract as usual.
+
+**Extraction is LLM output: treat proposals as untrusted.** They land behind
+the same trust policy, scoping and audit as agent writes.
+
+### MCP server (agents & Claude Desktop)
+
+```bash
+go build -o memmcp ./cmd/memmcp
+```
+
+Claude Desktop config snippet:
+
+```json
+{
+  "mcpServers": {
+    "soc-memory": {
+      "command": "/path/to/memmcp",
+      "env": {
+        "MEM_CH_ADDR": "localhost:9000",
+        "MEM_MCP_ACTOR_TYPE": "agent",
+        "MEM_MCP_ACTOR_ID": "claude-desktop",
+        "MEM_MCP_SCOPE": "team-a"
+      }
+    }
+  }
+}
+```
+
+Tools: `memory_enrich`, `memory_search`, `memory_traverse`,
+`memory_record_observation`, `memory_assert_fact`. Recall results are wrapped
+in `<memory-context>` fences (data-not-instructions). The MCP connection
+inherits ONE identity from env — whoever talks to the pipe IS that identity;
+per-user identity arrives with OIDC (future).
+
 ## Layout
 
 ```
 cmd/memserved   HTTP server          internal/memory   core domain logic
 cmd/memseed     JSONL backfill       internal/entity   normalization + resolution
 cmd/memeval     recall@k evals       internal/embed    LM Studio/OpenAI client
+cmd/graphrebuild Dgraph rebuild      internal/extract  LLM fact proposals
+cmd/memmcp      MCP stdio server     internal/graph    Dgraph projection + schema
 internal/ch     connect + migrations internal/api      HTTP transport
-evals/*.yaml    eval definitions     seeds/*.jsonl     sample data
+internal/mcpserver  MCP tool layer   evals/*.yaml      eval definitions
 ```

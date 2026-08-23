@@ -15,6 +15,11 @@ import (
 	"socmem/internal/entity"
 )
 
+// maxResponseBytes caps model responses; a hostile/broken endpoint must not
+// stream unbounded into memory. 10 MiB dwarfs any legitimate embedding or
+// chat payload.
+const maxResponseBytes = 10 << 20
+
 const defaultTimeout = 60 * time.Second
 
 const (
@@ -138,7 +143,7 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("extract: read response: %w", err)
 	}
