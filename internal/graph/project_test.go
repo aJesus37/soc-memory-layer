@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/google/uuid"
 
 	"socmem/internal/ch"
 	"socmem/internal/config"
@@ -559,4 +560,87 @@ func TestProjectEdgesBatch(t *testing.T) {
 		t.Errorf("targets %v missing expected endpoints %s / %s",
 			targets, eObj1.EntityID, eObj2.EntityID)
 	}
+}
+
+// Regression: pagination and the watermark CAS must order id tiebreakers the
+// SAME way, or a page boundary inside a same-millisecond cluster freezes the
+// cursor in an infinite re-read loop.
+//
+// mem.edges.edge_id is UUID; ClickHouse filters/compares UUIDs in its
+// internal byte order, which disagrees with canonical text order — while the
+// watermark's String last_id is compared as text by updateCursor's CAS. The
+// two rows below sit on opposite sides of that disagreement (pair-order says
+// A < B; text order says B < A), so with batch=1 the pre-fix projector
+// served [A] then [B], then had its CAS ('df49…' < '5169…' textually false)
+// reject every subsequent advance forever.
+func TestProjectEdgesTiebreakerOrderRegression(t *testing.T) {
+	ctx := itestCtx(t)
+	s, conn := itestBoth(t)
+
+	scope := fmt.Sprintf("itest-tiebreak-%x", time.Now().UnixNano())
+	eSubj := seedEntity(t, ctx, conn, scope, "198.51.100.41")
+	eObj := seedEntity(t, ctx, conn, scope, "T1098")
+	if n, err := ProjectEntities(ctx, s, conn, 10); err != nil || n != 2 {
+		t.Fatalf("ProjectEntities = (%d, %v), want (2, nil)", n, err)
+	}
+
+	// Two open edges sharing ONE updated_at instant, with engineered ids:
+	// pairUUID sorts before textUUID in ClickHouse's internal UUID order,
+	// but AFTER it in canonical text order.
+	const (
+		pairUUID = "df49d9d2-779f-4e9d-8181-62d43121fa57"
+		textUUID = "516926c9-b1ae-46c9-83d6-c98105182371"
+	)
+	sameMs := time.Now().UTC().Truncate(time.Millisecond)
+	for _, id := range []string{pairUUID, textUUID} {
+		eid, err := uuid.Parse(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := conn.PrepareBatch(ctx,
+			"INSERT INTO mem.edges "+
+				"(edge_id, scope, src_id, dst_id, relation, from_fact, valid_from, valid_to, updated_at)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Append(eid, scope,
+			mustParseUUID(t, eSubj.EntityID), mustParseUUID(t, eObj.EntityID),
+			"communicates_with", uuid.Nil, sameMs,
+			time.Date(2105, 12, 31, 23, 59, 59, 0, time.UTC), sameMs); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Send(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var total int
+	drained := false
+	for i := 0; i < 10; i++ { // cap: the pre-fix code never drains
+		n, err := ProjectEdges(ctx, s, conn, 1)
+		if err != nil {
+			t.Fatalf("step %d: ProjectEdges: %v", i, err)
+		}
+		total += n
+		if n == 0 {
+			drained = true
+			break
+		}
+	}
+	if !drained || total != 2 {
+		t.Fatalf("edge projection did not drain cleanly (drained=%v total=%d): cursor frozen on tiebreaker mismatch", drained, total)
+	}
+	wm := readWatermarkValue(t, ctx, conn, watermarkEdges)
+	if wm.Unix() == 0 {
+		t.Error("edges watermark still at epoch after drain")
+	}
+}
+
+func mustParseUUID(t *testing.T, s string) uuid.UUID {
+	t.Helper()
+	u, err := uuid.Parse(s)
+	if err != nil {
+		t.Fatalf("parse uuid %q: %v", s, err)
+	}
+	return u
 }

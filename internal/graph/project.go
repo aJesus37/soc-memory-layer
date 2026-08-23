@@ -29,15 +29,26 @@ const (
 	// needs a parseable value that sorts before every real id.
 	nilUUID = "00000000-0000-0000-0000-000000000000"
 
+	// toString(entity_id/edge_id) is LOAD-BEARING in both predicates below:
+	// those columns are UUID, and ClickHouse compares/filters UUIDs in its
+	// INTERNAL byte order, which disagrees with the canonical text order the
+	// ORDER BY would suggest AND with the watermark's String-typed last_id
+	// that updateCursor's CAS compares as text. A page boundary landing
+	// inside a same-millisecond id cluster could then mint a cursor that the
+	// CAS judged non-forward (zero rows matched) while pagination kept
+	// serving pages past it — freezing the projector in an infinite re-read
+	// loop (observed live: hundreds of identical no-op mutations).
+	// Casting the tiebreaker to String pins pagination, ORDER BY and the
+	// watermark CAS to ONE canonical-text total order.
 	entityPageQuery = "SELECT entity_id, scope, entity_type, key, display_name, " +
 		"first_seen, last_seen, updated_at FROM mem.entities FINAL " +
-		"WHERE (updated_at, entity_id) > (?, ?) " +
-		"ORDER BY updated_at ASC, entity_id ASC LIMIT ?"
+		"WHERE (updated_at, toString(entity_id)) > (?, ?) " +
+		"ORDER BY updated_at ASC, toString(entity_id) ASC LIMIT ?"
 
 	edgePageQuery = "SELECT edge_id, scope, src_id, dst_id, relation, from_fact, " +
 		"valid_from, valid_to, updated_at FROM mem.edges " +
-		"WHERE (updated_at, edge_id) > (?, ?) " +
-		"ORDER BY updated_at ASC, edge_id ASC LIMIT ?"
+		"WHERE (updated_at, toString(edge_id)) > (?, ?) " +
+		"ORDER BY updated_at ASC, toString(edge_id) ASC LIMIT ?"
 )
 
 // ProjectEntities projects mem.entities rows newer than the stored watermark
@@ -49,8 +60,9 @@ const (
 // Watermark invariant (exactly-once per version, idempotent under replay):
 //
 //   - The cursor is the composite (ts, last_id). Pages are read with strict
-//     tuple comparison WHERE (updated_at, entity_id) > (?, ?) ORDER BY
-//     updated_at, entity_id LIMIT batch. The secondary entity_id key makes
+//     tuple comparison WHERE (updated_at, toString(entity_id)) > (?, ?)
+//     ORDER BY updated_at, toString(entity_id) LIMIT batch. The secondary
+//     entity_id key makes
 //     the total order deterministic across runs, so keyset pagination
 //     neither skips nor repeats rows: every row whose (updated_at,
 //     entity_id) sorts after the cursor is projected exactly once. FINAL
@@ -282,8 +294,9 @@ func formatCHTimestamp(ts time.Time) string {
 // predicates if hunts ever need parallel relations on one pair.
 //
 // Watermark invariant: identical composite-cursor mechanics as
-// ProjectEntities — pages read WHERE (updated_at, edge_id) > (?, ?) in a
-// deterministic total order; the cursor advances to the last row only after
+// ProjectEntities — pages read WHERE (updated_at, toString(edge_id)) > (?, ?)
+// in a deterministic total order; the cursor advances to the last row only
+// after
 // the Dgraph write commits; any earlier error returns before advancement
 // and replays the page harmlessly.
 //
