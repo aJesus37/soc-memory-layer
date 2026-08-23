@@ -13,3 +13,4 @@ a new one that links back. Statuses: *accepted*, *superseded by ADR-N*.
 | [006](adr-006-dreaming-lite-extraction.md) | Async batched fact extraction ("dreaming-lite") | accepted |
 | [007](adr-007-keyset-cursor-textual-order.md) | Keyset cursor with textual UUID ordering; UUIDv7 identifiers | accepted |
 | [008](adr-008-rrf-hybrid-recall.md) | Reciprocal Rank Fusion for hybrid recall; no BM25 dependency | accepted |
+| [009](adr-009-remote-mcp-bearer-auth.md) | Remote MCP via Streamable HTTP with bearer-token identity | accepted |

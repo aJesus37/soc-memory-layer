@@ -149,13 +149,10 @@ the observation and moves on (no wedge). Review proposals via
 **Extraction is LLM output: treat proposals as untrusted.** They land behind
 the same trust policy, scoping and audit as agent writes.
 
-### MCP server (agents & opencode)
+### MCP server — local stdio or shared remote
 
-```bash
-go build -o memmcp ./cmd/memmcp
-```
-
-opencode config (`opencode.json` project-level or `~/.config/opencode/opencode.json`):
+**Local (stdio):** each machine builds `memmcp` and points it at the central
+stores. opencode config (`opencode.json`):
 
 ```json
 {
@@ -165,7 +162,8 @@ opencode config (`opencode.json` project-level or `~/.config/opencode/opencode.j
       "type": "local",
       "command": ["/path/to/memmcp"],
       "environment": {
-        "MEM_CH_ADDR": "localhost:9000",
+        "MEM_CH_ADDR": "clickhouse.internal:9000",
+        "MEM_DGRAPH_ADDR": "dgraph.internal:9080",
         "MEM_MCP_ACTOR_TYPE": "agent",
         "MEM_MCP_ACTOR_ID": "opencode-agent",
         "MEM_MCP_SCOPE": "team-a"
@@ -174,6 +172,33 @@ opencode config (`opencode.json` project-level or `~/.config/opencode/opencode.j
   }
 }
 ```
+
+**Remote (shared deployment):** one memmcp serves the whole team over
+Streamable HTTP with per-user bearer tokens:
+
+```bash
+# tokens.json: [{"token":"smem_<64hex>","actor_type":"human","actor_id":"analyst-j","scope":"team-a"}, ...]
+MEM_MCP_HTTP_ADDR=127.0.0.1:18443 MEM_MCP_TOKENS_FILE=tokens.json ./memmcp
+# terminate TLS at your reverse proxy; tokens are bearer credentials
+```
+
+opencode config for the remote server:
+
+```json
+{
+  "mcp": {
+    "soc-memory": {
+      "type": "remote",
+      "url": "https://memory.internal.company/mcp",
+      "headers": { "Authorization": "Bearer smem_<your-token>" }
+    }
+  }
+}
+```
+
+Token file rules: `smem_` + 64 hex chars, unique, actor `human|agent`.
+Missing/invalid token → 401 before anything touches memory. See
+[ADR-009](docs/adr/adr-009-remote-mcp-bearer-auth.md).
 
 Tools: `memory_enrich`, `memory_search`, `memory_traverse`,
 `memory_record_observation`, `memory_assert_fact`. Recall results are wrapped

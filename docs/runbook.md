@@ -97,3 +97,20 @@ human promote regardless.
 | audit | forever — evidence-adjacent, no TTL permitted |
 | extract_log | indefinite (coverage marker; tiny) |
 | Dgraph | disposable; rebuilt via graphrebuild |
+
+## MCP remote deployment & tokens
+
+HTTP mode requires a tokens file; startup fails closed without one.
+
+Issue a token:
+```bash
+echo "{"token":"smem_$(openssl rand -hex 32)","actor_type":"human","actor_id":"analyst-x","scope":"team-a"}" >> /etc/socmem/tokens.json
+# then restart memmcp (no hot reload yet)
+```
+
+Revoke: remove the record from tokens.json and restart. Audit who did what via
+mem.audit (attribution rides the token's identity).
+
+Deploy behind a TLS-terminating reverse proxy; add proxy-level rate limiting
+on /mcp if internet-exposed. Bind to loopback on the app host and let the
+proxy carry external traffic.
