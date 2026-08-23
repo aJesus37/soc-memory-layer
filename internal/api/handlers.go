@@ -414,6 +414,59 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+// --- GET /v1/traverse?key=&type=&relation=&hops= ----------------------------
+
+// pathJSON is one walked route: nodes[i+1] hangs off nodes[i] via
+// relations[i]. The start entity is always nodes[0].
+type pathJSON struct {
+	Nodes     []entityJSON `json:"nodes"`
+	Relations []string     `json:"relations"`
+}
+
+type traverseResp struct {
+	Paths []pathJSON `json:"paths"`
+}
+
+func (s *Server) handleTraverse(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	key := q.Get("key")
+	typ := q.Get("type")
+	if key == "" || typ == "" {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "type and key are required")
+		return
+	}
+	hops := 1 // API default; Traverse validates the [1,3] range itself
+	if raw := q.Get("hops"); raw != "" {
+		parsed, ok := parseIntParam(w, raw, "hops")
+		if !ok {
+			return
+		}
+		hops = parsed
+	}
+	paths, err := s.svc.Traverse(r.Context(), ctxString(r, ctxScope), key,
+		entity.Type(typ), q.Get("relation"), hops)
+	if err != nil {
+		mapServiceError(w, err) // ErrInvalidInput (bad hops/relation) → 400 here
+		return
+	}
+	out := traverseResp{Paths: make([]pathJSON, 0, len(paths))}
+	for _, p := range paths {
+		pj := pathJSON{
+			Nodes:     make([]entityJSON, 0, len(p.Nodes)),
+			Relations: p.Relations,
+		}
+		for _, e := range p.Nodes {
+			pj.Nodes = append(pj.Nodes, entityJSON{
+				ID: e.EntityID, Type: string(e.EntityType),
+				Key: e.Key, DisplayName: e.DisplayName,
+				FirstSeen: e.FirstSeen, LastSeen: e.LastSeen,
+			})
+		}
+		out.Paths = append(out.Paths, pj)
+	}
+	writeJSON(w, out)
+}
+
 // --- GET /healthz -----------------------------------------------------------
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

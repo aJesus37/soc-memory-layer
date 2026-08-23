@@ -18,13 +18,16 @@ import (
 	"socmem/internal/config"
 	"socmem/internal/embed"
 	"socmem/internal/entity"
+	"socmem/internal/graph"
 	"socmem/internal/memory"
 )
 
 var apiScopeSeq atomic.Int64
 
 // buildService wires a memory.Service against the integration DB with a fake
-// embedder, running migrations. Skips when MEM_TEST_CH_ADDR is unset.
+// embedder, running migrations. Skips when MEM_TEST_CH_ADDR is unset. When
+// MEM_TEST_DGRAPH_ADDR is also set, a graph store is attached so Traverse
+// runs in graph mode; otherwise tests exercise the CH fallback.
 func buildService(t *testing.T) (*memory.Service, *entity.Resolver, driver.Conn) {
 	t.Helper()
 	addr := os.Getenv("MEM_TEST_CH_ADDR")
@@ -42,7 +45,19 @@ func buildService(t *testing.T) (*memory.Service, *entity.Resolver, driver.Conn)
 		t.Fatal(err)
 	}
 	res := entity.NewResolver(conn)
-	return memory.New(conn, res, embed.NewFake(8), config.Load()), res, conn
+	svc := memory.New(conn, res, embed.NewFake(8), config.Load())
+	if dgAddr := os.Getenv("MEM_TEST_DGRAPH_ADDR"); dgAddr != "" {
+		g, err := graph.Connect(ctx, dgAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = g.Close() })
+		if err := g.InstallSchema(ctx); err != nil {
+			t.Fatal(err)
+		}
+		svc = svc.WithGraph(g)
+	}
+	return svc, res, conn
 }
 
 // testServer builds an API server on top of buildService.
@@ -51,6 +66,44 @@ func testServer(t *testing.T) (*Server, http.Handler, *memory.Service, *entity.R
 	svc, res, conn := buildService(t)
 	srv := New(svc, conn, config.Load())
 	return srv, srv.Routes(), svc, res
+}
+
+// apiEnv bundles everything a graph-mode API test needs: the server under
+// test plus the raw service/connection/store handles for seeding and
+// projection. g is nil when MEM_TEST_DGRAPH_ADDR is unset.
+type apiEnv struct {
+	srv  *Server
+	h    http.Handler
+	svc  *memory.Service
+	res  *entity.Resolver
+	conn driver.Conn
+	g    *graph.Store
+}
+
+// graphStoreOf re-attaches a throwaway store handle for tests that must
+// call the projector directly; nil when no Dgraph addr is configured.
+func graphStoreOf(t *testing.T) *graph.Store {
+	t.Helper()
+	dgAddr := os.Getenv("MEM_TEST_DGRAPH_ADDR")
+	if dgAddr == "" {
+		return nil
+	}
+	g, err := graph.Connect(context.Background(), dgAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+	return g
+}
+
+// testServerFull is testServer plus direct access to the underlying
+// connection and an independent graph-store handle (nil without
+// MEM_TEST_DGRAPH_ADDR).
+func testServerFull(t *testing.T) apiEnv {
+	t.Helper()
+	svc, res, conn := buildService(t)
+	srv := New(svc, conn, config.Load())
+	return apiEnv{srv: srv, h: srv.Routes(), svc: svc, res: res, conn: conn, g: graphStoreOf(t)}
 }
 
 // newIdentity returns header set bound to a unique per-call scope so tests
@@ -450,5 +503,132 @@ func TestHealthzAndSpoofing(t *testing.T) {
 	rec = do(t, h, "GET", "/v1/enrich?type=ioc_ip&key=1.1.1.1", nil, newIdentity(t, "human"), nil)
 	if got := rec.Header().Get("X-Mem-Actor"); got != "human:actor-human" {
 		t.Fatalf("X-Mem-Actor echo wrong: %q", got)
+	}
+}
+
+// TestTraverseOverHTTP seeds A→B→C through the REAL writers on a
+// graph-mode server, projects both stores, and walks from A over HTTP.
+// Skips cleanly when MEM_TEST_DGRAPH_ADDR is unset (fallback-mode server:
+// the endpoint still answers, capped at one hop).
+func TestTraverseOverHTTP(t *testing.T) {
+	env := testServerFull(t)
+	if env.g == nil {
+		t.Skip("MEM_TEST_DGRAPH_ADDR not set; skipping graph-mode traverse API test")
+	}
+	hdrs := newIdentity(t, "human")
+	ctx := context.Background()
+	scope := hdrs["X-Scope"]
+
+	resolve := func(raw string) entity.Entity {
+		e, created, err := env.res.Resolve(ctx, scope, raw)
+		if err != nil || !created {
+			t.Fatalf("resolve %q: created=%v err=%v", raw, created, err)
+		}
+		return e
+	}
+	a := resolve("api-traverse-a.example.com")
+	b := resolve("api-traverse-b.example.com")
+	c := resolve("api-traverse-c.example.com")
+
+	assertEdge := func(subject entity.Entity, predicate, objVal string, object entity.Entity) {
+		f, err := env.svc.AssertFact(ctx, memory.FactInput{
+			Scope: scope, SubjectID: subject.EntityID, Predicate: predicate,
+			ObjectValue: objVal, ObjectID: object.EntityID,
+			Confidence: 0.9, ActorType: "human", ActorID: "analyst-api",
+		})
+		if err != nil || f.Status != memory.Active {
+			t.Fatalf("assert %s: status=%s err=%v", predicate, f.Status, err)
+		}
+	}
+	assertEdge(a, "communicates_with", "beacon", b)
+	assertEdge(b, "resolved_to", "infra", c)
+
+	// Project until drained so the walk sees the full chain.
+	for i := 0; i < 100; i++ {
+		nEnt, err := graph.ProjectEntities(ctx, env.g, env.conn, 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nEdge, err := graph.ProjectEdges(ctx, env.g, env.conn, 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nEnt == 0 && nEdge == 0 {
+			break
+		}
+	}
+
+	type apiPath struct {
+		Nodes []struct {
+			ID          string `json:"id"`
+			Type        string `json:"type"`
+			Key         string `json:"key"`
+			DisplayName string `json:"display_name"`
+		} `json:"nodes"`
+		Relations []string `json:"relations"`
+	}
+	var resp struct {
+		Paths []apiPath `json:"paths"`
+	}
+	rec := do(t, env.h, "GET",
+		"/v1/traverse?key=api-traverse-a.example.com&type=ioc_domain&hops=2",
+		nil, hdrs, &resp)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("traverse failed %d: %s", rec.Code, rec.Body.String())
+	}
+	found := false
+	for _, p := range resp.Paths {
+		if len(p.Nodes) == 3 && len(p.Relations) == 2 &&
+			p.Nodes[0].ID == a.EntityID && p.Nodes[1].ID == b.EntityID &&
+			p.Nodes[2].ID == c.EntityID &&
+			p.Relations[0] == "communicates_with" && p.Relations[1] == "resolved_to" {
+			found = true
+			for _, n := range p.Nodes {
+				if n.DisplayName == "" || n.Type != string(entity.IocDomain) {
+					t.Fatalf("unhydrated node over HTTP: %+v", p.Nodes)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no A->B->C path in %d HTTP paths: %+v", len(resp.Paths), resp.Paths)
+	}
+
+	// hops default = 1: every returned path is single-hop.
+	resp.Paths = nil
+	rec = do(t, env.h, "GET",
+		"/v1/traverse?key=api-traverse-a.example.com&type=ioc_domain", nil, hdrs, &resp)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default-hops traverse failed %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(resp.Paths) == 0 {
+		t.Fatal("default hops returned no paths")
+	}
+	for _, p := range resp.Paths {
+		if len(p.Relations) != 1 {
+			t.Fatalf("default hops returned multi-hop path: %+v", p)
+		}
+	}
+
+	// Out-of-range hops surfaces as 400 via ErrInvalidInput mapping.
+	rec = do(t, env.h, "GET",
+		"/v1/traverse?key=api-traverse-a.example.com&type=ioc_domain&hops=4",
+		nil, hdrs, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("hops=4 got %d want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	// Malformed relation charset → 400.
+	rec = do(t, env.h, "GET",
+		"/v1/traverse?key=api-traverse-a.example.com&type=ioc_domain&relation=BAD",
+		nil, hdrs, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad relation got %d want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	// Missing key/type → 400 before reaching the service.
+	rec = do(t, env.h, "GET", "/v1/traverse?type=ioc_domain", nil, hdrs, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing key got %d want 400", rec.Code)
 	}
 }

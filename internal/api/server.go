@@ -58,6 +58,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /v1/facts/{id}/promote", s.identity(s.writeLimit(s.handlePromoteFact)))
 	mux.Handle("POST /v1/facts/{id}/retract", s.identity(s.writeLimit(s.handleRetractFact)))
 	mux.Handle("GET /v1/enrich", s.identity(s.handleEnrich))
+	mux.Handle("GET /v1/traverse", s.identity(s.handleTraverse))
 	mux.Handle("GET /v1/similar", s.identity(s.handleSimilar))
 	mux.Handle("GET /v1/timeline", s.identity(s.handleTimeline))
 	return mux
