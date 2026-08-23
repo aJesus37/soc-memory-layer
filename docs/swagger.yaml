@@ -1,0 +1,601 @@
+basePath: /
+definitions:
+  internal_api.assertFactReq:
+    properties:
+      client_event_id:
+        type: string
+      confidence:
+        type: number
+      object_id:
+        type: string
+      object_value:
+        type: string
+      predicate:
+        type: string
+      source_obs:
+        type: string
+      subject_id:
+        type: string
+    type: object
+  internal_api.createObservationReq:
+    properties:
+      case_id:
+        type: string
+      client_event_id:
+        type: string
+      confidentiality:
+        type: string
+      content:
+        type: string
+      kind:
+        type: string
+      ts:
+        description: RFC3339; omitted = now
+        type: string
+    type: object
+  internal_api.enrichResp:
+    properties:
+      entity:
+        $ref: '#/definitions/internal_api.entityJSON'
+      facts:
+        items:
+          $ref: '#/definitions/internal_api.factViewJSON'
+        type: array
+      found:
+        type: boolean
+      neighbors:
+        items:
+          $ref: '#/definitions/internal_api.neighborJSON'
+        type: array
+      observations:
+        items:
+          $ref: '#/definitions/internal_api.obsViewJSON'
+        type: array
+    type: object
+  internal_api.entityJSON:
+    properties:
+      display_name:
+        type: string
+      first_seen:
+        type: string
+      id:
+        type: string
+      key:
+        type: string
+      last_seen:
+        type: string
+      type:
+        type: string
+    type: object
+  internal_api.errBody:
+    properties:
+      error:
+        $ref: '#/definitions/internal_api.errInner'
+    type: object
+  internal_api.errInner:
+    properties:
+      code:
+        type: string
+      message:
+        type: string
+    type: object
+  internal_api.eventJSON:
+    properties:
+      actor_id:
+        type: string
+      id:
+        type: string
+      kind:
+        type: string
+      source:
+        type: string
+      text:
+        type: string
+      ts:
+        type: string
+    type: object
+  internal_api.factResp:
+    properties:
+      confidence:
+        type: number
+      id:
+        type: string
+      object_value:
+        type: string
+      predicate:
+        type: string
+      scope:
+        type: string
+      status:
+        type: string
+      subject_id:
+        type: string
+      valid_from:
+        type: string
+      written_by:
+        type: string
+    type: object
+  internal_api.factViewJSON:
+    properties:
+      confidence:
+        type: number
+      id:
+        type: string
+      object_value:
+        type: string
+      predicate:
+        type: string
+      source_obs:
+        type: string
+      status:
+        type: string
+      valid_from:
+        type: string
+      written_by:
+        type: string
+    type: object
+  internal_api.healthResp:
+    properties:
+      status:
+        type: string
+    type: object
+  internal_api.neighborJSON:
+    properties:
+      direction:
+        type: string
+      entity_id:
+        type: string
+      relation:
+        type: string
+    type: object
+  internal_api.obsViewJSON:
+    properties:
+      excerpt:
+        type: string
+      id:
+        type: string
+      kind:
+        type: string
+      ts:
+        type: string
+    type: object
+  internal_api.observationResp:
+    properties:
+      actor_id:
+        type: string
+      actor_type:
+        type: string
+      embedded:
+        type: boolean
+      entity_ids:
+        items:
+          type: string
+        type: array
+      id:
+        type: string
+      kind:
+        type: string
+      scope:
+        type: string
+      ts:
+        type: string
+    type: object
+  internal_api.pathJSON:
+    properties:
+      nodes:
+        items:
+          $ref: '#/definitions/internal_api.entityJSON'
+        type: array
+      relations:
+        items:
+          type: string
+        type: array
+    type: object
+  internal_api.retractReq:
+    properties:
+      reason:
+        type: string
+    type: object
+  internal_api.searchHitJSON:
+    properties:
+      excerpt:
+        type: string
+      kind:
+        type: string
+      matched_by:
+        items:
+          type: string
+        type: array
+      obs_id:
+        type: string
+      score:
+        type: number
+      ts:
+        type: string
+    type: object
+  internal_api.transitionResp:
+    properties:
+      fact:
+        $ref: '#/definitions/internal_api.factResp'
+      transitioned_by:
+        type: string
+    type: object
+  internal_api.traverseResp:
+    properties:
+      paths:
+        items:
+          $ref: '#/definitions/internal_api.pathJSON'
+        type: array
+    type: object
+info:
+  contact:
+    name: SOC Platform Team
+  description: 'Shared memory layer for security operations: episodic observations,
+    versioned facts, hybrid recall, graph traversal.'
+  title: SOC Memory Layer API
+  version: "1.0"
+paths:
+  /healthz:
+    get:
+      consumes:
+      - application/json
+      description: Reports service health; pings ClickHouse with a short deadline.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Service healthy
+          schema:
+            $ref: '#/definitions/internal_api.healthResp'
+        "503":
+          description: Database unreachable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      summary: Liveness probe
+      tags:
+      - system
+  /v1/enrich:
+    get:
+      consumes:
+      - application/json
+      description: 'Entity card for one key: profile, facts, observations, and graph
+        neighbors.'
+      parameters:
+      - description: Entity type (e.g. ioc_ip, ioc_domain)
+        in: query
+        name: type
+        required: true
+        type: string
+      - description: Entity lookup key
+        in: query
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Entity card; found=false with empty lists when unknown
+          schema:
+            $ref: '#/definitions/internal_api.enrichResp'
+        "400":
+          description: Missing type/key or storage validation failure
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Enrich an entity
+      tags:
+      - recall
+  /v1/facts:
+    post:
+      consumes:
+      - application/json
+      description: Assert a subject-predicate-object fact; agents propose, humans
+        write active versions directly.
+      parameters:
+      - description: Fact payload
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api.assertFactReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Written fact (proposed or active per actor type)
+          schema:
+            $ref: '#/definitions/internal_api.factResp'
+        "400":
+          description: Invalid body or oversized predicate/value
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "429":
+          description: Agent write budget exhausted (Retry-After set)
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Assert a fact
+      tags:
+      - write
+  /v1/facts/{id}/promote:
+    post:
+      consumes:
+      - application/json
+      description: Transition a proposed fact to active; human-gated.
+      parameters:
+      - description: Fact ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Promoted fact with the current version ID
+          schema:
+            $ref: '#/definitions/internal_api.transitionResp'
+        "400":
+          description: Invalid fact ID
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "403":
+          description: Only human actors may promote (human_gated)
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "404":
+          description: Fact not found or ID consumed by an earlier transition
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "409":
+          description: Fact is not in proposed status
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "429":
+          description: Agent write budget exhausted (Retry-After set)
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Promote a fact
+      tags:
+      - write
+  /v1/facts/{id}/retract:
+    post:
+      consumes:
+      - application/json
+      description: Mark a fact retracted with an optional reason; human-gated. Empty
+        request body allowed.
+      parameters:
+      - description: Fact ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Optional reason
+        in: body
+        name: request
+        schema:
+          $ref: '#/definitions/internal_api.retractReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Retracted fact with the current version ID
+          schema:
+            $ref: '#/definitions/internal_api.transitionResp'
+        "400":
+          description: Invalid fact ID or malformed body
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "403":
+          description: Only human actors may retract (human_gated)
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "404":
+          description: Fact not found or ID consumed by an earlier transition
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "409":
+          description: Fact already retracted
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "429":
+          description: Agent write budget exhausted (Retry-After set)
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Retract a fact
+      tags:
+      - write
+  /v1/observations:
+    post:
+      consumes:
+      - application/json
+      description: Store a new episodic observation; actor identity comes from X-Actor-*
+        headers, never the body.
+      parameters:
+      - description: Observation payload
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/internal_api.createObservationReq'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Created observation
+          schema:
+            $ref: '#/definitions/internal_api.observationResp'
+        "400":
+          description: Invalid body, oversized content, or invalid ts
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "429":
+          description: Agent write budget exhausted (Retry-After set)
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Record an observation
+      tags:
+      - write
+  /v1/similar:
+    get:
+      consumes:
+      - application/json
+      description: Semantic + keyword hybrid search over the scope's observations,
+        ranked.
+      parameters:
+      - description: Natural-language query text
+        in: query
+        name: q
+        required: true
+        type: string
+      - description: Maximum hits in [1,50] (default 10)
+        in: query
+        name: k
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Ranked hits (possibly empty)
+          schema:
+            items:
+              $ref: '#/definitions/internal_api.searchHitJSON'
+            type: array
+        "400":
+          description: Missing q or out-of-range/non-integer k
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Hybrid recall search
+      tags:
+      - recall
+  /v1/timeline:
+    get:
+      consumes:
+      - application/json
+      description: Chronological events scoped to exactly one of case_id or entity_id.
+      parameters:
+      - description: Case UUID (exactly one of case_id/entity_id)
+        in: query
+        name: case_id
+        type: string
+      - description: Entity ID (exactly one of case_id/entity_id)
+        in: query
+        name: entity_id
+        type: string
+      - description: Page size (default 50)
+        in: query
+        name: limit
+        type: integer
+      - description: Offset into the result set (default 0)
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Events, newest first
+          schema:
+            items:
+              $ref: '#/definitions/internal_api.eventJSON'
+            type: array
+        "400":
+          description: Both/neither selector given or non-integer paging
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Case or entity timeline
+      tags:
+      - recall
+  /v1/traverse:
+    get:
+      consumes:
+      - application/json
+      description: Walk relations outward from an entity up to hops (1-3); degrades
+        to at most 1 hop without Dgraph.
+      parameters:
+      - description: Start entity lookup key
+        in: query
+        name: key
+        required: true
+        type: string
+      - description: Start entity type (e.g. ioc_domain)
+        in: query
+        name: type
+        required: true
+        type: string
+      - description: Restrict edges to one relation type
+        in: query
+        name: relation
+        type: string
+      - description: Hops in [1,3] (default 1)
+        in: query
+        name: hops
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Walked paths from the start entity
+          schema:
+            $ref: '#/definitions/internal_api.traverseResp'
+        "400":
+          description: Missing type/key, bad hops, or malformed relation
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+        "502":
+          description: Storage temporarily unavailable
+          schema:
+            $ref: '#/definitions/internal_api.errBody'
+      security:
+      - IdentityHeaders: []
+      summary: Graph traversal
+      tags:
+      - recall
+securityDefinitions:
+  IdentityHeaders:
+    description: Plus X-Actor-ID and X-Scope headers; identity never travels in bodies.
+    in: header
+    name: X-Actor-Type
+    type: apiKey
+swagger: "2.0"

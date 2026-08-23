@@ -52,8 +52,8 @@ const (
 )
 
 // ProjectEntities projects mem.entities rows newer than the stored watermark
-// into Dgraph nodes keyed by their ClickHouse UUID (the exact-indexed,
-// @upsert ch_id predicate), then advances the watermark row named
+// into Dgraph nodes keyed by their ClickHouse UUID (the exact-indexed
+// "@upsert" ch_id predicate), then advances the watermark row named
 // "entities". It returns the number of entities projected in this call.
 // batch bounds the page size; values <= 0 select defaultBatch.
 //

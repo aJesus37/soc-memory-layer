@@ -63,6 +63,20 @@ type observationResp struct {
 	Embedded  bool      `json:"embedded"`
 }
 
+// CreateObservation handles POST /v1/observations.
+//
+//	@Summary		Record an observation
+//	@Description	Store a new episodic observation; actor identity comes from X-Actor-* headers, never the body.
+//	@Tags			write
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			request	body		createObservationReq	true	"Observation payload"
+//	@Success		200		{object}	observationResp			"Created observation"
+//	@Failure		400		{object}	errBody					"Invalid body, oversized content, or invalid ts"
+//	@Failure		429		{object}	errBody					"Agent write budget exhausted (Retry-After set)"
+//	@Failure		502		{object}	errBody					"Storage temporarily unavailable"
+//	@Router			/v1/observations [post]
 func (s *Server) handleCreateObservation(w http.ResponseWriter, r *http.Request) {
 	var req createObservationReq
 	if !decodeJSON(w, r, &req) {
@@ -130,6 +144,20 @@ type factResp struct {
 	WrittenBy   string    `json:"written_by"`
 }
 
+// AssertFact handles POST /v1/facts.
+//
+//	@Summary		Assert a fact
+//	@Description	Assert a subject-predicate-object fact; agents propose, humans write active versions directly.
+//	@Tags			write
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			request	body		assertFactReq	true	"Fact payload"
+//	@Success		200		{object}	factResp		"Written fact (proposed or active per actor type)"
+//	@Failure		400		{object}	errBody			"Invalid body or oversized predicate/value"
+//	@Failure		429		{object}	errBody			"Agent write budget exhausted (Retry-After set)"
+//	@Failure		502		{object}	errBody			"Storage temporarily unavailable"
+//	@Router			/v1/facts [post]
 func (s *Server) handleAssertFact(w http.ResponseWriter, r *http.Request) {
 	var req assertFactReq
 	if !decodeJSON(w, r, &req) {
@@ -176,10 +204,51 @@ type transitionResp struct {
 	TransitionedBy string   `json:"transitioned_by"`
 }
 
+// retractReq mirrors the optional retract body for schema generation; the
+// handler decodes the identical shape inline (empty/truncated bodies tolerated).
+type retractReq struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// PromoteFact handles POST /v1/facts/{id}/promote.
+//
+//	@Summary		Promote a fact
+//	@Description	Transition a proposed fact to active; human-gated.
+//	@Tags			write
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			id	path		string			true	"Fact ID (UUID)"
+//	@Success		200	{object}	transitionResp	"Promoted fact with the current version ID"
+//	@Failure		400	{object}	errBody			"Invalid fact ID"
+//	@Failure		403	{object}	errBody			"Only human actors may promote (human_gated)"
+//	@Failure		404	{object}	errBody			"Fact not found or ID consumed by an earlier transition"
+//	@Failure		409	{object}	errBody			"Fact is not in proposed status"
+//	@Failure		429	{object}	errBody			"Agent write budget exhausted (Retry-After set)"
+//	@Failure		502	{object}	errBody			"Storage temporarily unavailable"
+//	@Router			/v1/facts/{id}/promote [post]
 func (s *Server) handlePromoteFact(w http.ResponseWriter, r *http.Request) {
 	s.transition(w, r, "promote")
 }
 
+// RetractFact handles POST /v1/facts/{id}/retract.
+//
+//	@Summary		Retract a fact
+//	@Description	Mark a fact retracted with an optional reason; human-gated. Empty request body allowed.
+//	@Tags			write
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			id		path		string			true	"Fact ID (UUID)"
+//	@Param			request	body		retractReq		false	"Optional reason"
+//	@Success		200		{object}	transitionResp	"Retracted fact with the current version ID"
+//	@Failure		400		{object}	errBody			"Invalid fact ID or malformed body"
+//	@Failure		403		{object}	errBody			"Only human actors may retract (human_gated)"
+//	@Failure		404		{object}	errBody			"Fact not found or ID consumed by an earlier transition"
+//	@Failure		409		{object}	errBody			"Fact already retracted"
+//	@Failure		429		{object}	errBody			"Agent write budget exhausted (Retry-After set)"
+//	@Failure		502		{object}	errBody			"Storage temporarily unavailable"
+//	@Router			/v1/facts/{id}/retract [post]
 func (s *Server) handleRetractFact(w http.ResponseWriter, r *http.Request) {
 	s.transition(w, r, "retract")
 }
@@ -281,6 +350,20 @@ type neighborJSON struct {
 	Direction string `json:"direction"`
 }
 
+// Enrich handles GET /v1/enrich.
+//
+//	@Summary		Enrich an entity
+//	@Description	Entity card for one key: profile, facts, observations, and graph neighbors.
+//	@Tags			recall
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			type	query		string		true	"Entity type (e.g. ioc_ip, ioc_domain)"
+//	@Param			key		query		string		true	"Entity lookup key"
+//	@Success		200		{object}	enrichResp	"Entity card; found=false with empty lists when unknown"
+//	@Failure		400		{object}	errBody		"Missing type/key or storage validation failure"
+//	@Failure		502		{object}	errBody		"Storage temporarily unavailable"
+//	@Router			/v1/enrich [get]
 func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	key := q.Get("key")
@@ -333,6 +416,20 @@ type searchHitJSON struct {
 	MatchedBy []string  `json:"matched_by"`
 }
 
+// Similar handles GET /v1/similar.
+//
+//	@Summary		Hybrid recall search
+//	@Description	Semantic + keyword hybrid search over the scope's observations, ranked.
+//	@Tags			recall
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			q	query		string			true	"Natural-language query text"
+//	@Param			k	query		integer			false	"Maximum hits in [1,50] (default 10)"
+//	@Success		200	{array}		searchHitJSON	"Ranked hits (possibly empty)"
+//	@Failure		400	{object}	errBody			"Missing q or out-of-range/non-integer k"
+//	@Failure		502	{object}	errBody			"Storage temporarily unavailable"
+//	@Router			/v1/similar [get]
 func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	query := q.Get("q")
@@ -374,6 +471,22 @@ type eventJSON struct {
 	Text    string    `json:"text"`
 }
 
+// Timeline handles GET /v1/timeline.
+//
+//	@Summary		Case or entity timeline
+//	@Description	Chronological events scoped to exactly one of case_id or entity_id.
+//	@Tags			recall
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			case_id		query		string		false	"Case UUID (exactly one of case_id/entity_id)"
+//	@Param			entity_id	query		string		false	"Entity ID (exactly one of case_id/entity_id)"
+//	@Param			limit		query		integer		false	"Page size (default 50)"
+//	@Param			offset		query		integer		false	"Offset into the result set (default 0)"
+//	@Success		200			{array}		eventJSON	"Events, newest first"
+//	@Failure		400			{object}	errBody		"Both/neither selector given or non-integer paging"
+//	@Failure		502			{object}	errBody		"Storage temporarily unavailable"
+//	@Router			/v1/timeline [get]
 func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	caseID := q.Get("case_id")
@@ -427,6 +540,22 @@ type traverseResp struct {
 	Paths []pathJSON `json:"paths"`
 }
 
+// Traverse handles GET /v1/traverse.
+//
+//	@Summary		Graph traversal
+//	@Description	Walk relations outward from an entity up to hops (1-3); degrades to at most 1 hop without Dgraph.
+//	@Tags			recall
+//	@Accept			json
+//	@Produce		json
+//	@Security		IdentityHeaders
+//	@Param			key			query		string			true	"Start entity lookup key"
+//	@Param			type		query		string			true	"Start entity type (e.g. ioc_domain)"
+//	@Param			relation	query		string			false	"Restrict edges to one relation type"
+//	@Param			hops		query		integer			false	"Hops in [1,3] (default 1)"
+//	@Success		200			{object}	traverseResp	"Walked paths from the start entity"
+//	@Failure		400			{object}	errBody			"Missing type/key, bad hops, or malformed relation"
+//	@Failure		502			{object}	errBody			"Storage temporarily unavailable"
+//	@Router			/v1/traverse [get]
 func (s *Server) handleTraverse(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	key := q.Get("key")
@@ -469,6 +598,22 @@ func (s *Server) handleTraverse(w http.ResponseWriter, r *http.Request) {
 
 // --- GET /healthz -----------------------------------------------------------
 
+// healthResp mirrors the /healthz body shape for schema generation; the
+// handler writes the same JSON via a string map.
+type healthResp struct {
+	Status string `json:"status"`
+}
+
+// Healthz handles GET /healthz.
+//
+//	@Summary		Liveness probe
+//	@Description	Reports service health; pings ClickHouse with a short deadline.
+//	@Tags			system
+//	@Accept			json
+//	@Produce		json
+//	@Success		200	{object}	healthResp	"Service healthy"
+//	@Failure		503	{object}	errBody		"Database unreachable"
+//	@Router			/healthz [get]
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()

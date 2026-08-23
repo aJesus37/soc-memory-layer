@@ -26,6 +26,16 @@ import (
 // extractionBatch bounds observations proposed per extraction tick.
 const extractionBatch = 32
 
+// @title						SOC Memory Layer API
+// @version					1.0
+// @description				Shared memory layer for security operations: episodic observations, versioned facts, hybrid recall, graph traversal.
+// @contact.name				SOC Platform Team
+// @BasePath					/
+//
+// @securityDefinitions.apikey	IdentityHeaders
+// @in							header
+// @name						X-Actor-Type
+// @description				Plus X-Actor-ID and X-Scope headers; identity never travels in bodies.
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
