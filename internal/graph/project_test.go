@@ -1,4 +1,7 @@
-package graph
+// External test package: these tests import internal/memory (real-writer
+// seeding), and memory imports graph for Traverse — an in-package test
+// would form a test-only import cycle.
+package graph_test
 
 import (
 	"context"
@@ -16,7 +19,15 @@ import (
 	"socmem/internal/config"
 	"socmem/internal/embed"
 	"socmem/internal/entity"
+	"socmem/internal/graph"
 	"socmem/internal/memory"
+)
+
+// wmEntities / wmEdges duplicate the unexported projection watermark names
+// (project.go watermarkEntities / watermarkEdges); keep in sync.
+const (
+	wmEntities = "entities"
+	wmEdges    = "edges"
 )
 
 // itestBoth wires the full projection stack against live services: fresh
@@ -24,7 +35,7 @@ import (
 // Tests seeded after this get exact global counts because the suite runs
 // package binaries serially (make itest -p 1) and nothing else writes these
 // tables.
-func itestBoth(t *testing.T) (*Store, driver.Conn) {
+func itestBoth(t *testing.T) (*graph.Store, driver.Conn) {
 	t.Helper()
 	if os.Getenv("MEM_TEST_CH_ADDR") == "" {
 		t.Skip("MEM_TEST_CH_ADDR / MEM_TEST_DGRAPH_ADDR not set; skipping projection integration test")
@@ -54,7 +65,7 @@ func itestBoth(t *testing.T) (*Store, driver.Conn) {
 			t.Fatalf("wipe %s: %v", table, err)
 		}
 	}
-	for _, name := range []string{watermarkEntities, watermarkEdges} {
+	for _, name := range []string{wmEntities, wmEdges} {
 		if err := conn.Exec(ctx,
 			"ALTER TABLE mem.projection_watermark "+
 				"UPDATE ts = toDateTime64(0, 3), last_id = '' "+
@@ -104,7 +115,7 @@ type nodeView struct {
 
 // fetchNodes returns the projected nodes for the given ch_ids keyed by ch_id;
 // ids without a node are absent from the map.
-func fetchNodes(t *testing.T, s *Store, ctx context.Context, chIDs ...string) map[string]nodeView {
+func fetchNodes(t *testing.T, s *graph.Store, ctx context.Context, chIDs ...string) map[string]nodeView {
 	t.Helper()
 	literals := make([]string, len(chIDs))
 	for i, id := range chIDs {
@@ -156,7 +167,7 @@ func TestProjectEntities(t *testing.T) {
 	eHash := seedEntity(t, ctx, conn, scope, rawHash)
 	all := []string{eIP.EntityID, eTech.EntityID, eHash.EntityID}
 
-	n, err := ProjectEntities(ctx, s, conn, 10)
+	n, err := graph.ProjectEntities(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("ProjectEntities: %v", err)
 	}
@@ -206,7 +217,7 @@ func TestProjectEntities(t *testing.T) {
 
 	// Drained replay: nothing new in CH, so nothing is written and every uid
 	// is untouched.
-	n, err = ProjectEntities(ctx, s, conn, 10)
+	n, err = graph.ProjectEntities(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("second ProjectEntities: %v", err)
 	}
@@ -236,7 +247,7 @@ func TestProjectEntities(t *testing.T) {
 	}
 	prevLastSeen := nodes[eIP.EntityID].LastSeen
 
-	n, err = ProjectEntities(ctx, s, conn, 10)
+	n, err = graph.ProjectEntities(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("refresh projection: %v", err)
 	}
@@ -289,7 +300,7 @@ func TestProjectEntitiesBatchBoundary(t *testing.T) {
 		t.Fatalf("expected 3 seeded entities, got %d (%v)", len(ordered), ordered)
 	}
 
-	wmPrev := readWatermarkValue(t, ctx, conn, watermarkEntities)
+	wmPrev := readWatermarkValue(t, ctx, conn, wmEntities)
 	type step struct {
 		wantN int
 		want  []string // ch_ids expected present after this call
@@ -300,14 +311,14 @@ func TestProjectEntitiesBatchBoundary(t *testing.T) {
 		{wantN: 0, want: ordered},
 	}
 	for i, stp := range steps {
-		n, err := ProjectEntities(ctx, s, conn, 2)
+		n, err := graph.ProjectEntities(ctx, s, conn, 2)
 		if err != nil {
 			t.Fatalf("step %d: ProjectEntities: %v", i, err)
 		}
 		if n != stp.wantN {
 			t.Errorf("step %d wrote %d nodes, want %d", i, n, stp.wantN)
 		}
-		wmNow := readWatermarkValue(t, ctx, conn, watermarkEntities)
+		wmNow := readWatermarkValue(t, ctx, conn, wmEntities)
 		if wmNow.Before(wmPrev) {
 			t.Errorf("step %d rewound watermark: %v -> %v", i, wmPrev, wmNow)
 		}
@@ -358,7 +369,7 @@ type outgoingView struct {
 
 // fetchOutgoing returns the projected view of one ch_id's node, including
 // its outgoing related_to edges and facets. A missing node yields ok=false.
-func fetchOutgoing(t *testing.T, s *Store, ctx context.Context, chID string) (outgoingView, bool) {
+func fetchOutgoing(t *testing.T, s *graph.Store, ctx context.Context, chID string) (outgoingView, bool) {
 	t.Helper()
 	q := fmt.Sprintf(
 		`{ q(func: eq(ch_id, %q)) { uid related_to @facets(relation, valid_from, valid_to) { uid ch_id } } }`,
@@ -413,13 +424,13 @@ func TestProjectEdges(t *testing.T) {
 	eObj1 := seedEntity(t, ctx, conn, scope, "198.51.100.9")
 	eObj2 := seedEntity(t, ctx, conn, scope, "198.51.100.10")
 
-	if n, err := ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
+	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
 		t.Fatalf("ProjectEntities = (%d, %v), want (3, nil)", n, err)
 	}
 
 	// Open-edge projection: the activated fact's edge appears with facets.
 	f1 := assertFactWithObject(t, svc, scope, eSubj.EntityID, "communicates_with", "c2", eObj1.EntityID)
-	n, err := ProjectEdges(ctx, s, conn, 10)
+	n, err := graph.ProjectEdges(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("ProjectEdges: %v", err)
 	}
@@ -455,7 +466,7 @@ func TestProjectEdges(t *testing.T) {
 	// process in one call: old closed -> delete triple, new open -> set.
 	time.Sleep(1100 * time.Millisecond)
 	f2 := assertFactWithObject(t, svc, scope, eSubj.EntityID, "communicates_with", "benign-parked", eObj2.EntityID)
-	n, err = ProjectEdges(ctx, s, conn, 10)
+	n, err = graph.ProjectEdges(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("supersede ProjectEdges: %v", err)
 	}
@@ -479,7 +490,7 @@ func TestProjectEdges(t *testing.T) {
 	if _, err := svc.RetractFact(ctx, f2.ID, "false positive", "human", "analyst-edge-test"); err != nil {
 		t.Fatalf("retract: %v", err)
 	}
-	n, err = ProjectEdges(ctx, s, conn, 10)
+	n, err = graph.ProjectEdges(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("retract ProjectEdges: %v", err)
 	}
@@ -492,7 +503,7 @@ func TestProjectEdges(t *testing.T) {
 	}
 
 	// Drained replay: nothing new, nothing written.
-	n, err = ProjectEdges(ctx, s, conn, 10)
+	n, err = graph.ProjectEdges(ctx, s, conn, 10)
 	if err != nil {
 		t.Fatalf("drained ProjectEdges: %v", err)
 	}
@@ -513,7 +524,7 @@ func TestProjectEdgesBatch(t *testing.T) {
 	eObj2 := seedEntity(t, ctx, conn, scope, "203.0.113.31")
 	all := []string{eSubj.EntityID, eObj1.EntityID, eObj2.EntityID}
 
-	if n, err := ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
+	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
 		t.Fatalf("ProjectEntities = (%d, %v), want (3, nil)", n, err)
 	}
 
@@ -528,16 +539,16 @@ func TestProjectEdgesBatch(t *testing.T) {
 	eLate := seedEntity(t, ctx, conn, scope, "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855")
 	assertFactWithObject(t, svc, scope, eSubj.EntityID, "drops", "z", eLate.EntityID)
 
-	wmPrev := readWatermarkValue(t, ctx, conn, watermarkEdges)
+	wmPrev := readWatermarkValue(t, ctx, conn, wmEdges)
 	for i, wantN := range []int{1, 1, 1, 0} {
-		n, err := ProjectEdges(ctx, s, conn, 1)
+		n, err := graph.ProjectEdges(ctx, s, conn, 1)
 		if err != nil {
 			t.Fatalf("step %d: ProjectEdges: %v", i, err)
 		}
 		if n != wantN {
 			t.Errorf("step %d processed %d rows, want %d", i, n, wantN)
 		}
-		wmNow := readWatermarkValue(t, ctx, conn, watermarkEdges)
+		wmNow := readWatermarkValue(t, ctx, conn, wmEdges)
 		if wmNow.Before(wmPrev) {
 			t.Errorf("step %d rewound watermark: %v -> %v", i, wmPrev, wmNow)
 		}
@@ -580,7 +591,7 @@ func TestProjectEdgesTiebreakerOrderRegression(t *testing.T) {
 	scope := fmt.Sprintf("itest-tiebreak-%x", time.Now().UnixNano())
 	eSubj := seedEntity(t, ctx, conn, scope, "198.51.100.41")
 	eObj := seedEntity(t, ctx, conn, scope, "T1098")
-	if n, err := ProjectEntities(ctx, s, conn, 10); err != nil || n != 2 {
+	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 2 {
 		t.Fatalf("ProjectEntities = (%d, %v), want (2, nil)", n, err)
 	}
 
@@ -617,7 +628,7 @@ func TestProjectEdgesTiebreakerOrderRegression(t *testing.T) {
 	var total int
 	drained := false
 	for i := 0; i < 10; i++ { // cap: the pre-fix code never drains
-		n, err := ProjectEdges(ctx, s, conn, 1)
+		n, err := graph.ProjectEdges(ctx, s, conn, 1)
 		if err != nil {
 			t.Fatalf("step %d: ProjectEdges: %v", i, err)
 		}
@@ -630,7 +641,7 @@ func TestProjectEdgesTiebreakerOrderRegression(t *testing.T) {
 	if !drained || total != 2 {
 		t.Fatalf("edge projection did not drain cleanly (drained=%v total=%d): cursor frozen on tiebreaker mismatch", drained, total)
 	}
-	wm := readWatermarkValue(t, ctx, conn, watermarkEdges)
+	wm := readWatermarkValue(t, ctx, conn, wmEdges)
 	if wm.Unix() == 0 {
 		t.Error("edges watermark still at epoch after drain")
 	}

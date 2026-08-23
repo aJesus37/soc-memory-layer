@@ -1,4 +1,6 @@
-package graph
+// External test package: internal/memory imports graph (Traverse), so
+// keeping these tests outside the package avoids a test-only import cycle.
+package graph_test
 
 import (
 	"context"
@@ -8,6 +10,8 @@ import (
 	"time"
 
 	"github.com/dgraph-io/dgo/v250/protos/api"
+
+	"socmem/internal/graph"
 )
 
 // itestCtx bounds each integration test's work so a wedged container fails
@@ -19,13 +23,13 @@ func itestCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-func itestGraph(t *testing.T) *Store {
+func itestGraph(t *testing.T) *graph.Store {
 	t.Helper()
 	addr := os.Getenv("MEM_TEST_DGRAPH_ADDR")
 	if addr == "" {
 		t.Skip("MEM_TEST_DGRAPH_ADDR not set; skipping Dgraph integration test")
 	}
-	s, err := Connect(itestCtx(t), addr)
+	s, err := graph.Connect(itestCtx(t), addr)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -179,7 +183,7 @@ func typeNames(s dqlSchema) []string {
 	return names
 }
 
-func readSchema(t *testing.T, s *Store) dqlSchema {
+func readSchema(t *testing.T, s *graph.Store) dqlSchema {
 	t.Helper()
 	resp, err := s.Dgraph().NewReadOnlyTxn().Query(itestCtx(t), "schema {}")
 	if err != nil {
@@ -205,7 +209,7 @@ func readSchema(t *testing.T, s *Store) dqlSchema {
 	return out
 }
 
-func countKeyNodes(t *testing.T, s *Store) int {
+func countKeyNodes(t *testing.T, s *graph.Store) int {
 	t.Helper()
 	resp, err := s.Dgraph().NewReadOnlyTxn().Query(itestCtx(t), `{ q(func: has(key)) { count(uid) } }`)
 	if err != nil {

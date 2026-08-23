@@ -16,6 +16,7 @@ import (
 	"socmem/internal/config"
 	"socmem/internal/embed"
 	"socmem/internal/entity"
+	"socmem/internal/graph"
 )
 
 // maxEntityCandidates bounds entity extraction per observation so a single
@@ -88,6 +89,7 @@ type Service struct {
 	cfg      config.Config
 	trust    trustConfig
 	log      *slog.Logger
+	graph    *graph.Store
 }
 
 // New builds a Service over an open ClickHouse connection. The trust
@@ -102,6 +104,16 @@ func New(conn driver.Conn, r *entity.Resolver, e embed.Embedder, cfg config.Conf
 		trust:    loadTrustConfig(),
 		log:      slog.Default(),
 	}
+}
+
+// WithGraph attaches the Dgraph-backed projection store, enabling the
+// multi-hop Traverse leg; nil detaches it and pins Traverse to the ≤1-hop
+// ClickHouse fallback. Chainable so wiring reads as
+// memory.New(...).WithGraph(g). The store is owned by the caller (close it
+// at shutdown); the service only reads through it.
+func (s *Service) WithGraph(g *graph.Store) *Service {
+	s.graph = g
+	return s
 }
 
 // RecordObservation validates input, links entities found in content,

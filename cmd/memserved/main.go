@@ -16,6 +16,7 @@ import (
 	"socmem/internal/config"
 	"socmem/internal/embed"
 	"socmem/internal/entity"
+	"socmem/internal/graph"
 	"socmem/internal/memory"
 )
 
@@ -54,6 +55,24 @@ func main() {
 
 	resolver := entity.NewResolver(conn)
 	svc := memory.New(conn, resolver, embedder, cfg)
+
+	// Phase-2 graph store. Optional by design: when Dgraph is unreachable
+	// the service starts anyway and Traverse degrades to the ≤1-hop
+	// ClickHouse fallback (design §6 failure table) — only a warn marks the
+	// degraded mode. Schema install is idempotent and keeps a fresh
+	// deployment projection-ready without a separate bootstrap step.
+	if g, err := graph.Connect(ctx, cfg.DgraphAddr); err != nil {
+		logger.Warn("dgraph unavailable; traverse degrades to clickhouse fallback",
+			"addr", cfg.DgraphAddr, "err", err)
+	} else {
+		if err := g.InstallSchema(ctx); err != nil {
+			logger.Warn("dgraph schema install failed; edge projection may fail",
+				"err", err)
+		}
+		svc = svc.WithGraph(g)
+		defer g.Close()
+		logger.Info("graph store attached", "addr", cfg.DgraphAddr)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
