@@ -81,8 +81,15 @@ func TestMCPStdioSmoke(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	srvCtx, cancel := context.WithCancel(context.Background())
+	// Handlers take identity from the request context since the Phase-4
+	// refactor; stdio injects its fixed identity via SetContextFunc exactly
+	// as cmd/memmcp/main.go does.
+	stdio := server.NewStdioServer(mcpSrv)
+	stdio.SetContextFunc(func(ctx context.Context) context.Context {
+		return mcpserver.WithIdentity(ctx, mcpserver.Identity{ActorType: "human", ActorID: "smoke-tester", Scope: scope})
+	})
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- server.NewStdioServer(mcpSrv).Listen(srvCtx, inR, outW) }()
+	go func() { listenErr <- stdio.Listen(srvCtx, inR, outW) }()
 
 	lines := make(chan string, 32)
 	readerDone := make(chan struct{})
