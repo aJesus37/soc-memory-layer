@@ -18,15 +18,27 @@ import (
 // sub-selection alongside the directive, e.g.
 // related_to @facets(relation) { uid }, which returns keys like
 // "related_to|relation".
+// first_seen/last_seen back the projected entity nodes (Task 5); first_seen
+// is hour-indexed for future time-window traversals.
 const schemaText = `
 	scope: string @index(hash) @upsert .
 	key: string @index(hash) @upsert .
 	ch_id: string @index(exact) @upsert .
 	entity_type: string @index(hash) .
 	display_name: string .
+	first_seen: datetime @index(hour) .
+	last_seen: datetime .
 	related_to: [uid] @reverse .
 
-	type Entity { }
+	type Entity {
+		ch_id
+		scope
+		key
+		entity_type
+		display_name
+		first_seen
+		last_seen
+	}
 `
 
 // InstallSchema creates or updates the projection schema via Alter.
