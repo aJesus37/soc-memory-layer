@@ -46,10 +46,14 @@ type SearchHit struct {
 	MatchedBy []string // sorted subset of {"vec","txt"}
 }
 
-// The three leg-combination variants of the fusion query. Which variant
-// runs depends on two independent facts: did the query embed, and does the
-// query carry any indexable tokens? A missing fact skips that leg entirely
-// rather than running a degenerate one:
+// The fusion statement is assembled from single-source fragments: each
+// leg and the shared dedup+fusion suffix exist exactly once below, and the
+// three run-time variants are combinations built by buildSimilar rather
+// than hand-copied statements, so a change to one fragment cannot drift
+// between variants. Which legs run depends on two independent facts: did
+// the query embed, and does the query carry any indexable tokens? A
+// missing fact skips that leg entirely rather than running a degenerate
+// one:
 //
 //   - hybrid: both legs fuse (normal path)
 //   - vec-only: zero tokens (e.g. CJK-only query); hasAnyTokens with an
@@ -57,52 +61,87 @@ type SearchHit struct {
 //   - txt-only: embedder failed; mirrors RecordObservation's write-side
 //     degrade so recall survives an embedding outage
 //
+// Retry duplicates: storage does not collapse repeated ClientEventIDs (see
+// Input), so a physical MergeTree duplicate can enter either leg several
+// times at several ranks. fused collapses each (obs_id, src) pair to its
+// best (lowest) rank BEFORE scoring, and obs folds duplicate rows to one
+// deterministic winner, so every observation contributes at most one term
+// per leg, matched_by never repeats a source, and one obs_id yields
+// exactly one hit.
+//
+// Rank provenance: the vec leg ranks by ascending cosineDistance; the txt
+// leg ranks by ts DESC so its implicit prior favors recent rows (the vec
+// ordering already encodes semantic proximity). Both start at 1.
+//
 // Constants bind via %d (ints, injection-safe); all user-controlled values
 // are server-bound ? parameters. ORDER BY score DESC breaks ties on obs_id
 // ASC because distinct observations can tie on RRF sums across legs; the
 // tie-break makes pagination deterministic.
 var (
-	similarHybridSQL = fmt.Sprintf(
-		"WITH vec_leg AS ("+
+	vecLegSQL = fmt.Sprintf(
+		"vec_leg AS ("+
 			"SELECT obs_id, row_number() OVER (ORDER BY cosineDistance(content_vec, ?)) AS rnk "+
-			"FROM mem.observations WHERE scope = ? AND length(content_vec) > 0 LIMIT %d), "+
-			"txt_leg AS ("+
-			"SELECT obs_id, row_number() OVER () AS rnk FROM mem.observations "+
-			"WHERE scope = ? AND hasAnyTokens(content, ?) LIMIT %d) "+
-			"SELECT o.obs_id, o.scope, o.ts, o.kind, substringUTF8(o.content, 1, %d) AS excerpt, "+
-			"sum(1.0 / (%d + f.rnk)) AS score, groupArray(f.src) AS matched_by "+
-			"FROM (SELECT obs_id, 'vec' AS src, rnk FROM vec_leg "+
-			"UNION ALL "+
-			"SELECT obs_id, 'txt' AS src, rnk FROM txt_leg) f "+
-			"JOIN mem.observations o ON o.obs_id = f.obs_id AND o.scope = ? "+
-			"GROUP BY o.obs_id, o.scope, o.ts, o.kind, excerpt "+
-			"ORDER BY score DESC, o.obs_id ASC LIMIT ?",
-		legDepth, legDepth, maxExcerptRunes, rrfK)
+			"FROM mem.observations WHERE scope = ? AND length(content_vec) > 0 LIMIT %d)", legDepth)
 
-	similarVecOnlySQL = fmt.Sprintf(
-		"WITH vec_leg AS ("+
-			"SELECT obs_id, row_number() OVER (ORDER BY cosineDistance(content_vec, ?)) AS rnk "+
-			"FROM mem.observations WHERE scope = ? AND length(content_vec) > 0 LIMIT %d) "+
-			"SELECT o.obs_id, o.scope, o.ts, o.kind, substringUTF8(o.content, 1, %d) AS excerpt, "+
-			"sum(1.0 / (%d + f.rnk)) AS score, groupArray(f.src) AS matched_by "+
-			"FROM (SELECT obs_id, 'vec' AS src, rnk FROM vec_leg) f "+
-			"JOIN mem.observations o ON o.obs_id = f.obs_id AND o.scope = ? "+
-			"GROUP BY o.obs_id, o.scope, o.ts, o.kind, excerpt "+
-			"ORDER BY score DESC, o.obs_id ASC LIMIT ?",
-		legDepth, maxExcerptRunes, rrfK)
+	txtLegSQL = fmt.Sprintf(
+		"txt_leg AS ("+
+			"SELECT obs_id, row_number() OVER (ORDER BY ts DESC) AS rnk "+
+			"FROM mem.observations WHERE scope = ? AND hasAnyTokens(content, ?) LIMIT %d)", legDepth)
 
-	similarTxtOnlySQL = fmt.Sprintf(
-		"WITH txt_leg AS ("+
-			"SELECT obs_id, row_number() OVER () AS rnk FROM mem.observations "+
-			"WHERE scope = ? AND hasAnyTokens(content, ?) LIMIT %d) "+
-			"SELECT o.obs_id, o.scope, o.ts, o.kind, substringUTF8(o.content, 1, %d) AS excerpt, "+
-			"sum(1.0 / (%d + f.rnk)) AS score, groupArray(f.src) AS matched_by "+
-			"FROM (SELECT obs_id, 'txt' AS src, rnk FROM txt_leg) f "+
-			"JOIN mem.observations o ON o.obs_id = f.obs_id AND o.scope = ? "+
-			"GROUP BY o.obs_id, o.scope, o.ts, o.kind, excerpt "+
-			"ORDER BY score DESC, o.obs_id ASC LIMIT ?",
-		legDepth, maxExcerptRunes, rrfK)
+	vecTermSQL = "SELECT obs_id, 'vec' AS src, rnk FROM vec_leg"
+	txtTermSQL = "SELECT obs_id, 'txt' AS src, rnk FROM txt_leg"
 )
+
+// fusionSQL renders the shared suffix over the given union-of-terms
+// fragments: fused dedupes to the best rank per (obs_id, src); obs
+// collapses physical retry duplicates sharing an obs_id into one winner
+// row — earliest ts, lexicographically smallest content — so the final
+// join cannot emit two hits for one ObsID. kind uses any(): retries carry
+// identical kinds in practice, and no stable alternative exists without
+// inventing an arbitrary total order. The scope aggregate is aliased
+// obs_scope (NOT scope): ClickHouse substitutes aliases globally, so a
+// bare `scope` in this CTE's WHERE clause would resolve to the aggregate.
+func fusionSQL(terms []string) string {
+	return fmt.Sprintf(
+		"fused AS ("+
+			"SELECT obs_id, src, min(rnk) AS rnk FROM (%s) "+
+			"GROUP BY obs_id, src), "+
+			"obs AS ("+
+			"SELECT obs_id, min(scope) AS obs_scope, min(ts) AS ts, any(kind) AS kind, min(content) AS content "+
+			"FROM mem.observations WHERE scope = ? AND obs_id IN (SELECT obs_id FROM fused) "+
+			"GROUP BY obs_id) "+
+			"SELECT o.obs_id, o.obs_scope, o.ts, o.kind, substringUTF8(o.content, 1, %d) AS excerpt, "+
+			"sum(1.0 / (%d + f.rnk)) AS score, groupArray(f.src) AS matched_by "+
+			"FROM fused f JOIN obs o ON o.obs_id = f.obs_id "+
+			"GROUP BY o.obs_id, o.obs_scope, o.ts, o.kind, excerpt "+
+			"ORDER BY score DESC, o.obs_id ASC LIMIT ?",
+		strings.Join(terms, " UNION ALL "), maxExcerptRunes, rrfK)
+}
+
+// buildSimilar assembles the statement and its arguments for whichever
+// legs are live. Placeholder order follows SQL text order — each leg's
+// bindings are appended exactly where its fragment lands, then the obs
+// scope filter and the LIMIT — so args and ? positions can never drift
+// apart.
+func buildSimilar(scope string, qvec []float32, vecOK bool, tokens []string, k int) (string, []any) {
+	var (
+		ctes  []string
+		terms []string
+		args  []any
+	)
+	if vecOK {
+		ctes = append(ctes, vecLegSQL)
+		terms = append(terms, vecTermSQL)
+		args = append(args, qvec, scope)
+	}
+	if len(tokens) > 0 {
+		ctes = append(ctes, txtLegSQL)
+		terms = append(terms, txtTermSQL)
+		args = append(args, scope, tokens)
+	}
+	args = append(args, scope, k) // obs CTE scope filter, then result cap
+	return "WITH " + strings.Join(ctes, ", ") + ", " + fusionSQL(terms), args
+}
 
 // Similar recalls observations from one scope by fusing two independent
 // legs with Reciprocal Rank Fusion, score = Σ 1/(rrfK + rank):
@@ -110,7 +149,8 @@ var (
 //   - vec leg: top-legDepth rows by cosineDistance(content_vec, qvec),
 //     where qvec embeds the trimmed query as kind="query";
 //   - txt leg: top-legDepth rows whose content shares any token with the
-//     query, probed through the ft_idx text index (splitByNonAlpha
+//     query, ranked ts DESC so the implicit prior favors recent rows,
+//     probed through the ft_idx text index (splitByNonAlpha
 //     tokenizer, exact whole-token match, case-sensitive on the storage
 //     side — the Go side lowercases the query, but content casing must
 //     match exactly to hit).
@@ -121,6 +161,10 @@ var (
 // vec-only leg; losing both yields an empty result without touching CH.
 // Rows written through a degraded write path (empty content_vec) simply
 // never enter the vec leg.
+//
+// Physical retry duplicates sharing an obs_id are collapsed before fusion
+// (see the SQL assembly notes above): one obs contributes at most one term
+// per leg and surfaces as exactly one hit.
 //
 // k is the maximum number of hits returned and MUST be in [1,50]; there is
 // no default (the API layer owns defaulting). Ordering is deterministic:
@@ -134,29 +178,23 @@ func (s *Service) Similar(ctx context.Context, scope, query string, k int) ([]Se
 	if q == "" {
 		return nil, fmt.Errorf("memory: query required")
 	}
+	scopedScope := strings.TrimSpace(scope)
+	if scopedScope == "" {
+		// Same contract as RecordObservation: scope is mandatory, not a
+		// silent miss.
+		return nil, fmt.Errorf("memory: scope required")
+	}
 	if k < similarKMin || k > similarKMax {
 		return nil, fmt.Errorf("memory: k %d outside [%d,%d]", k, similarKMin, similarKMax)
 	}
 
-	scopedScope := strings.TrimSpace(scope)
 	tokens := queryTokens(q)
 	qvec, vecOK := s.embedQuery(ctx, q)
-
-	var sqlText string
-	args := make([]any, 0, 6)
-	switch {
-	case vecOK && len(tokens) > 0: // hybrid
-		sqlText = similarHybridSQL
-		args = append(args, qvec, scopedScope, scopedScope, tokens, scopedScope, k)
-	case vecOK: // vec-only: nothing the text index could match
-		sqlText = similarVecOnlySQL
-		args = append(args, qvec, scopedScope, scopedScope, k)
-	case len(tokens) > 0: // txt-only: embedder degraded
-		sqlText = similarTxtOnlySQL
-		args = append(args, scopedScope, tokens, scopedScope, k)
-	default: // embedder down AND nothing for the text index to bite on
+	if !vecOK && len(tokens) == 0 { // embedder down AND nothing for the text index to bite on
 		return []SearchHit{}, nil
 	}
+
+	sqlText, args := buildSimilar(scopedScope, qvec, vecOK, tokens, k)
 
 	hits := []SearchHit{}
 	rows, err := s.conn.Query(ctx, sqlText, args...)

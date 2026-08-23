@@ -10,6 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"socmem/internal/embed"
 )
 
@@ -48,15 +50,15 @@ func seedObs(t *testing.T, s *Service, scope, kind, actorType, content string) s
 // TestSimilarHybrid seeds A-E through RecordObservation (the real write
 // path), then fuses both legs for a 'beaconing' query.
 //
-// Leg expectations are derived locally from embed.NewFake(8) outputs:
+// Leg expectations:
 //
 //	txt leg: hasAnyTokens is exact-token and case-sensitive on the CH side
 //	         (verified against the live tokenizer, not assumed); the query
 //	         tokens {beaconing,detection,analysis} therefore match exactly
 //	         A and E ("beaconing") while B's "beacon"/"c2"/"traffic" do NOT.
-//	vec leg: legDepth=20 exceeds the five seeded rows with non-empty
-//	         content_vec, so every seeded observation gets a vec rank; the
-//	         ranks themselves come from recomputed fake embeddings.
+//	vec leg: legDepth=20 exceeds the five seeded rows, so every seeded
+//	         observation gets a vec rank; ordering teeth for that ranking
+//	         live in TestSimilarNoTokens, which recomputes it.
 //
 // A second phase seeds a separate scope through a failing embedder (all
 // content_vec empty) and queries it with the WORKING embedder: the vec leg
@@ -86,39 +88,6 @@ func TestSimilarHybrid(t *testing.T) {
 	}
 
 	const query = "beaconing detection analysis"
-
-	// Derive vec-leg membership from the fake embedder itself: documents
-	// were embedded as kind="document", the query is embedded as
-	// kind="query" by Similar. Rank ascending by distance.
-	fake := embed.NewFake(8)
-	docVecs, err := fake.Embed(ctx, "document", []string{
-		texts["A"], texts["B"], texts["C"], texts["D"], texts["E"],
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	qVecs, err := fake.Embed(ctx, "query", []string{query})
-	if err != nil {
-		t.Fatal(err)
-	}
-	type dist struct {
-		key string
-		d   float64
-	}
-	dists := make([]dist, 0, len(order))
-	for i, key := range order {
-		dists = append(dists, dist{key, cosineDist(docVecs[i], qVecs[0])})
-	}
-	sort.Slice(dists, func(i, j int) bool {
-		if dists[i].d != dists[j].d {
-			return dists[i].d < dists[j].d
-		}
-		return dists[i].key < dists[j].key
-	})
-	vecRank := map[string]int{}
-	for i, d := range dists {
-		vecRank[d.key] = i + 1 // row_number() OVER (...) starts at 1
-	}
 
 	hits, err := s.Similar(ctx, scope, query, 5)
 	if err != nil {
@@ -312,7 +281,8 @@ func TestSimilarDegradesToTextOnly(t *testing.T) {
 }
 
 // TestSimilarValidation pins the caller-side contract: trimmed-non-empty
-// query, k within [1,50]; there is NO default k (Task 15 owns defaulting).
+// query AND scope (mirroring RecordObservation), k within [1,50]; there is
+// NO default k (Task 15 owns defaulting).
 func TestSimilarValidation(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
@@ -322,6 +292,11 @@ func TestSimilarValidation(t *testing.T) {
 	for _, q := range []string{"", "   \t "} {
 		if _, err := s.Similar(ctx, scope, q, 10); err == nil {
 			t.Errorf("query %q: expected validation error, got nil", q)
+		}
+	}
+	for _, sc := range []string{"", "   "} {
+		if _, err := s.Similar(ctx, sc, "beaconing", 10); err == nil {
+			t.Errorf("scope %q: expected validation error, got nil", sc)
 		}
 	}
 	for _, k := range []int{0, -3, 51} {
@@ -334,22 +309,176 @@ func TestSimilarValidation(t *testing.T) {
 // TestSimilarNoTokens queries pure punctuation/CJK: no ASCII-alphanumeric
 // tokens exist, so the text leg must be skipped cleanly (never even
 // attempted) and results may only carry the vec source.
+//
+// It also gives the vec-leg ranking teeth: hit order must equal the
+// distance ranking recomputed from embed.NewFake outputs — ascending
+// cosineDist, which is exactly the row_number() ordering the vec leg
+// ranks by before RRF turns it into a 1/(rrfK+rank) score sequence.
 func TestSimilarNoTokens(t *testing.T) {
 	conn := itestConn(t)
 	ctx := context.Background()
 	s := testService(t, conn)
 	scope := itestScope()
 
-	seedObs(t, s, scope, "hunt_finding", "human", "some ordinary english content")
+	texts := []string{
+		"some ordinary english content",
+		"another plain note about backups",
+		"dns resolver latency spike on edge-03",
+		"quarterly access review checklist",
+	}
+	for _, c := range texts {
+		seedObs(t, s, scope, "hunt_finding", "human", c)
+	}
 
-	hits, err := s.Similar(ctx, scope, "你好世界！！！", 10)
+	query := "你好世界！！！"
+	hits, err := s.Similar(ctx, scope, query, 10)
 	if err != nil {
 		t.Fatalf("CJK-only query must not error: %v", err)
 	}
+
+	// The fake embedder vectorizes every row, so all seeds must surface
+	// through the vec leg alone.
+	if len(hits) != len(texts) {
+		t.Fatalf("hits = %d (%+v), want all %d seeded observations", len(hits), hits, len(texts))
+	}
 	for _, h := range hits {
-		for _, src := range h.MatchedBy {
-			if src == "txt" {
-				t.Errorf("no-token query produced txt match: %+v", h)
+		if strings.Join(h.MatchedBy, ",") != "vec" {
+			t.Errorf("no-token query hit matched_by = %v, want [vec] only", h.MatchedBy)
+		}
+	}
+
+	// Recompute the vec-leg distances locally and demand the fused order
+	// matches: scores are strictly monotone in vec rank, so hit order must
+	// be ascending recomputed distance. Adjacent ties in distance are
+	// tolerated only because CH may break equal-distance ties arbitrarily;
+	// distinct contents under the fake embedder make this a non-issue in
+	// practice.
+	fake := embed.NewFake(8)
+	docVecs, err := fake.Embed(ctx, "document", texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qVecs, err := fake.Embed(ctx, "query", []string{query})
+	if err != nil {
+		t.Fatal(err)
+	}
+	distOf := map[string]float64{}
+	for i, c := range texts {
+		distOf[c] = cosineDist(docVecs[i], qVecs[0])
+	}
+	prevD := math.Inf(-1)
+	for i, h := range hits {
+		d, ok := distOf[h.Excerpt]
+		if !ok {
+			t.Fatalf("hit %d excerpt %q outside seeded contents", i, h.Excerpt)
+		}
+		if d < prevD {
+			t.Errorf("hit %d distance %v breaks ascending recomputed ranking (prev %v)", i, d, prevD)
+		}
+		if d == prevD && i > 0 && h.ObsID <= hits[i-1].ObsID {
+			t.Errorf("tied-distance hits %d/%d must fall back to obs_id asc", i-1, i)
+		}
+		prevD = d
+	}
+}
+
+// TestSimilarDedupesRetriedObsID pins the retry-duplicate contract: two
+// physical rows sharing one obs_id (same ClientEventID submitted twice,
+// storage does not collapse them) must fuse to exactly ONE hit whose
+// matched_by carries each source at most once and whose score counts each
+// leg once. With this single observation in the scope both legs rank it
+// first, so score must be exactly 1/(k+1) + 1/(k+1).
+func TestSimilarDedupesRetriedObsID(t *testing.T) {
+	conn := itestConn(t)
+	ctx := context.Background()
+	s := testService(t, conn)
+	scope := itestScope()
+
+	const content = "ERROR beaconing detected from 9.9.9.9"
+	eventID := uuid.NewString()
+	for i := 0; i < 2; i++ { // ClientEventID retry -> second physical row, same obs_id
+		o, err := s.RecordObservation(ctx, Input{
+			Scope:         scope,
+			Kind:          "alert",
+			ActorType:     "agent",
+			ActorID:       "sensor-7",
+			ClientEventID: eventID,
+			Content:       content,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.ID != eventID {
+			t.Fatalf("retry %d: obs id %q, want canonical %q", i, o.ID, eventID)
+		}
+	}
+
+	hits, err := s.Similar(ctx, scope, "beaconing detection analysis", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("hits = %d (%+v), want exactly ONE hit for the duplicated obs_id", len(hits), hits)
+	}
+	h := hits[0]
+	if h.ObsID != eventID {
+		t.Errorf("hit obs_id %q, want %q", h.ObsID, eventID)
+	}
+	if strings.Join(h.MatchedBy, ",") != "txt,vec" {
+		t.Errorf("matched_by = %v, want exactly [txt vec] with no repeated source", h.MatchedBy)
+	}
+	wantScore := 2.0 / float64(rrfK+1)
+	if math.Abs(h.Score-wantScore) > 1e-9 {
+		t.Errorf("score = %v, want %v (each leg counted exactly once)", h.Score, wantScore)
+	}
+	if h.Excerpt != content {
+		t.Errorf("excerpt = %q, want %q", h.Excerpt, content)
+	}
+}
+
+// TestSimilarSQLAssembly is a pure unit test (no ClickHouse) guarding the
+// assembled variants: every ? must have a bound argument and vice versa,
+// and each variant must contain exactly the CTEs its live legs imply.
+// buildSimilar places each leg's bindings next to its fragment, so this
+// catches assembly regressions (drifted placeholder order, a leg skipped
+// in the union but not the args, …) without any infrastructure.
+func TestSimilarSQLAssembly(t *testing.T) {
+	qvec := make([]float32, 8)
+	tokens := []string{"beaconing"}
+	scope := "itest-scope"
+
+	cases := []struct {
+		name    string
+		vecOK   bool
+		tokens  []string
+		wantCTE []string
+		noCTE   []string
+	}{
+		{"hybrid", true, tokens, []string{"vec_leg AS", "txt_leg AS"}, nil},
+		{"vec-only", true, nil, []string{"vec_leg AS"}, []string{"txt_leg AS"}},
+		{"txt-only", false, tokens, []string{"txt_leg AS"}, []string{"vec_leg AS"}},
+	}
+	for _, tc := range cases {
+		sqlText, args := buildSimilar(scope, qvec, tc.vecOK, tc.tokens, 10)
+		if n := strings.Count(sqlText, "?"); n != len(args) {
+			t.Errorf("%s: %d placeholders vs %d args", tc.name, n, len(args))
+		}
+		for _, cte := range tc.wantCTE {
+			if !strings.Contains(sqlText, cte) {
+				t.Errorf("%s: missing %s", tc.name, cte)
+			}
+		}
+		for _, cte := range tc.noCTE {
+			if strings.Contains(sqlText, cte) {
+				t.Errorf("%s: must not reference %s", tc.name, cte)
+			}
+		}
+		for _, want := range []string{
+			"GROUP BY obs_id, src", "min(rnk)", "groupArray(f.src)",
+			"ORDER BY score DESC, o.obs_id ASC",
+		} {
+			if !strings.Contains(sqlText, want) {
+				t.Errorf("%s: shared fusion suffix lost %q", tc.name, want)
 			}
 		}
 	}
