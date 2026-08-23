@@ -813,8 +813,12 @@ func TestPromoteFact(t *testing.T) {
 	if !strings.Contains(summary, "prior="+prop.ID) {
 		t.Errorf("payload_summary missing prior id %s: %q", prop.ID, summary)
 	}
+	// Scan for leaked values with the prior-id token removed first: a hex
+	// object value like "c2" can collide with a digit of the random UUID
+	// (~12% of runs), which says nothing about actual leakage.
+	contentBearing := strings.Replace(summary, "prior="+prop.ID, "", 1)
 	for _, secret := range []string{"c2", "benign-parked"} {
-		if strings.Contains(summary, secret) {
+		if strings.Contains(contentBearing, secret) {
 			t.Errorf("payload_summary leaks %q: %q", secret, summary)
 		}
 	}
