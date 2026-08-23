@@ -75,16 +75,17 @@ func main() {
 	// bearer token per request) and therefore must not fail startup over it.
 	var fixedID *mcpserver.Identity
 	if httpAddr == "" {
+		if tokensFile != "" {
+			// Only a warn: harmless misconfiguration, but operators should
+			// know their tokens file is not protecting anything here.
+			logger.Warn("MEM_MCP_TOKENS_FILE set but unused: stdio mode has no HTTP surface to authenticate")
+		}
 		id, err := mcpserver.LoadIdentity()
 		if err != nil {
 			logger.Error("identity configuration invalid", "err", err)
 			os.Exit(1)
 		}
 		fixedID = &id
-	} else if tokensFile != "" {
-		// Only a warn: harmless misconfiguration, but operators should know
-		// their tokens file is not protecting anything in stdio mode.
-		logger.Warn("MEM_MCP_TOKENS_FILE set but unused: stdio mode has no HTTP surface to authenticate")
 	}
 
 	cfg := config.Load()
