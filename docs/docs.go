@@ -664,6 +664,10 @@ const docTemplate = `{
                 "last_seen": {
                     "type": "string"
                 },
+                "scope": {
+                    "description": "true origin scope of the hydrated row",
+                    "type": "string"
+                },
                 "type": {
                     "type": "string"
                 }
@@ -698,6 +702,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "kind": {
+                    "type": "string"
+                },
+                "origin_scope": {
+                    "description": "scope the underlying row lives in",
                     "type": "string"
                 },
                 "source": {
@@ -755,6 +763,10 @@ const docTemplate = `{
                 "object_value": {
                     "type": "string"
                 },
+                "origin_scope": {
+                    "description": "scope the fact was asserted in",
+                    "type": "string"
+                },
                 "predicate": {
                     "type": "string"
                 },
@@ -804,6 +816,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "kind": {
+                    "type": "string"
+                },
+                "origin_scope": {
+                    "description": "scope the observation was recorded in",
                     "type": "string"
                 },
                 "ts": {
@@ -884,6 +900,10 @@ const docTemplate = `{
                     }
                 },
                 "obs_id": {
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "originating scope (org-wide recall attribution)",
                     "type": "string"
                 },
                 "score": {

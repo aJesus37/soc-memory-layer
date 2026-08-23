@@ -9,7 +9,7 @@ import (
 	"net/http"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"github.com/swaggo/http-swagger"
+	httpSwagger "github.com/swaggo/http-swagger"
 
 	"socmem/internal/ch"
 	"socmem/internal/config"

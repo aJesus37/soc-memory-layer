@@ -260,6 +260,127 @@ func TestObservationRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCrossScopeAttributionOverHTTP seeds an observation and an active
+// org-visibility fact in team A's scope over HTTP, then reads them back
+// through a SECOND identity's scope and asserts every response surface
+// attributes to team-A: enrich's entity.scope plus per-fact /
+// per-observation origin_scope, the org-wide entity timeline's event labels,
+// and similar's per-hit scope.
+func TestCrossScopeAttributionOverHTTP(t *testing.T) {
+	_, h, _, res := testServer(t)
+	teamA := newIdentity(t, "human")
+	teamB := newIdentity(t, "human")
+	scopeA := teamA["X-Scope"]
+
+	key := "cross-origin.example.com"
+
+	subj, _, err := res.Resolve(context.Background(), scopeA, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var f struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	rec := do(t, h, "POST", "/v1/facts", map[string]any{
+		"subject_id": subj.EntityID, "predicate": "attributed_to",
+		"object_value": "actor-cross", "confidence": 0.8,
+	}, teamA, &f)
+	if rec.Code != http.StatusOK || f.Status != "active" {
+		t.Fatalf("assert failed %d status=%s: %s", rec.Code, f.Status, rec.Body.String())
+	}
+
+	rec = do(t, h, "POST", "/v1/observations", map[string]any{
+		"kind":    "human_statement",
+		"content": key + " beaconed toward actor-controlled.example.net",
+	}, teamA, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("obs create failed %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var er struct {
+		Found  bool `json:"found"`
+		Entity struct {
+			ID    string `json:"id"`
+			Scope string `json:"scope"`
+		} `json:"entity"`
+		Facts []struct {
+			ID          string `json:"id"`
+			OriginScope string `json:"origin_scope"`
+		} `json:"facts"`
+		Observations []struct {
+			ID          string `json:"id"`
+			OriginScope string `json:"origin_scope"`
+		} `json:"observations"`
+	}
+	rec = do(t, h, "GET", "/v1/enrich?type=ioc_domain&key="+key, nil, teamB, &er)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cross-scope enrich failed %d: %s", rec.Code, rec.Body.String())
+	}
+	if !er.Found || er.Entity.ID != subj.EntityID || er.Entity.Scope != scopeA {
+		t.Fatalf("entity attribution wrong: found=%v entity=%+v, want scope %q",
+			er.Found, er.Entity, scopeA)
+	}
+	if len(er.Facts) != 1 || er.Facts[0].ID != f.ID || er.Facts[0].OriginScope != scopeA {
+		t.Fatalf("facts wrong: %+v, want origin_scope %q", er.Facts, scopeA)
+	}
+	if len(er.Observations) == 0 {
+		t.Fatal("no observations on cross-scope enrich")
+	}
+	for _, o := range er.Observations {
+		if o.OriginScope != scopeA {
+			t.Fatalf("observation origin = %q, want %q", o.OriginScope, scopeA)
+		}
+	}
+
+	// Org-wide by-entity timeline read from B: A's fact event arrives
+	// labeled with A's origin scope.
+	var events []struct {
+		Source      string `json:"source"`
+		Kind        string `json:"kind"`
+		OriginScope string `json:"origin_scope"`
+	}
+	rec = do(t, h, "GET", "/v1/timeline?entity_id="+subj.EntityID, nil, teamB, &events)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("timeline failed %d: %s", rec.Code, rec.Body.String())
+	}
+	foundFactEvent := false
+	for _, e := range events {
+		if e.Source == "fact" && e.Kind == "fact:attributed_to" {
+			foundFactEvent = true
+			if e.OriginScope != scopeA {
+				t.Fatalf("fact event origin = %q, want %q", e.OriginScope, scopeA)
+			}
+		}
+	}
+	if !foundFactEvent {
+		t.Fatalf("no attributed_to fact event in cross-scope timeline: %+v", events)
+	}
+
+	// Org-wide similar read from B: hits carry their originating scope.
+	var hits []struct {
+		Scope   string `json:"scope"`
+		Excerpt string `json:"excerpt"`
+	}
+	rec = do(t, h, "GET", "/v1/similar?q=beaconed&k=5", nil, teamB, &hits)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("similar failed %d: %s", rec.Code, rec.Body.String())
+	}
+	foundHit := false
+	for _, hit := range hits {
+		if strings.Contains(hit.Excerpt, key) {
+			foundHit = true
+			if hit.Scope != scopeA {
+				t.Fatalf("hit scope = %q, want %q", hit.Scope, scopeA)
+			}
+		}
+	}
+	if !foundHit {
+		t.Fatalf("similar missed seeded cross-scope observation: %+v", hits)
+	}
+}
+
 func TestFactLifecycleOverHTTP(t *testing.T) {
 	_, h, svc, res := testServer(t)
 	human := newIdentity(t, "human")

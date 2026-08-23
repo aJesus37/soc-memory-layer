@@ -322,6 +322,7 @@ type entityJSON struct {
 	Type        string    `json:"type"`
 	Key         string    `json:"key"`
 	DisplayName string    `json:"display_name"`
+	Scope       string    `json:"scope"` // true origin scope of the hydrated row
 	FirstSeen   time.Time `json:"first_seen"`
 	LastSeen    time.Time `json:"last_seen"`
 }
@@ -335,13 +336,15 @@ type factViewJSON struct {
 	ValidFrom   time.Time `json:"valid_from"`
 	WrittenBy   string    `json:"written_by"`
 	SourceObs   string    `json:"source_obs"`
+	OriginScope string    `json:"origin_scope"` // scope the fact was asserted in
 }
 
 type obsViewJSON struct {
-	ID      string    `json:"id"`
-	Ts      time.Time `json:"ts"`
-	Kind    string    `json:"kind"`
-	Excerpt string    `json:"excerpt"`
+	ID          string    `json:"id"`
+	Ts          time.Time `json:"ts"`
+	Kind        string    `json:"kind"`
+	Excerpt     string    `json:"excerpt"`
+	OriginScope string    `json:"origin_scope"` // scope the observation was recorded in
 }
 
 type neighborJSON struct {
@@ -382,6 +385,7 @@ func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
 		out.Entity = entityJSON{
 			ID: res.Entity.EntityID, Type: string(res.Entity.EntityType),
 			Key: res.Entity.Key, DisplayName: res.Entity.DisplayName,
+			Scope:     res.Entity.Scope,
 			FirstSeen: res.Entity.FirstSeen, LastSeen: res.Entity.LastSeen,
 		}
 	}
@@ -390,11 +394,13 @@ func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
 			ID: f.ID, Predicate: f.Predicate, ObjectValue: f.ObjectValue,
 			Status: string(f.Status), Confidence: f.Confidence,
 			ValidFrom: f.ValidFrom, WrittenBy: f.WrittenBy, SourceObs: f.SourceObs,
+			OriginScope: f.OriginScope,
 		})
 	}
 	for _, o := range res.Observations {
 		out.Observations = append(out.Observations, obsViewJSON{
 			ID: o.ID, Ts: o.Ts, Kind: o.Kind, Excerpt: o.Excerpt,
+			OriginScope: o.OriginScope,
 		})
 	}
 	for _, n := range res.Neighbors {
@@ -409,6 +415,7 @@ func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request) {
 
 type searchHitJSON struct {
 	ObsID     string    `json:"obs_id"`
+	Scope     string    `json:"scope"` // originating scope (org-wide recall attribution)
 	Ts        time.Time `json:"ts"`
 	Kind      string    `json:"kind"`
 	Excerpt   string    `json:"excerpt"`
@@ -453,7 +460,7 @@ func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	out := make([]searchHitJSON, 0, len(hits))
 	for _, h := range hits {
 		out = append(out, searchHitJSON{
-			ObsID: h.ObsID, Ts: h.Ts, Kind: h.Kind, Excerpt: h.Excerpt,
+			ObsID: h.ObsID, Scope: h.Scope, Ts: h.Ts, Kind: h.Kind, Excerpt: h.Excerpt,
 			Score: h.Score, MatchedBy: h.MatchedBy,
 		})
 	}
@@ -463,12 +470,13 @@ func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
 // --- GET /v1/timeline?case_id=|entity_id=&limit=&offset= --------------------
 
 type eventJSON struct {
-	ID      string    `json:"id"`
-	Ts      time.Time `json:"ts"`
-	Source  string    `json:"source"`
-	Kind    string    `json:"kind"`
-	ActorID string    `json:"actor_id"`
-	Text    string    `json:"text"`
+	ID          string    `json:"id"`
+	Ts          time.Time `json:"ts"`
+	Source      string    `json:"source"`
+	Kind        string    `json:"kind"`
+	ActorID     string    `json:"actor_id"`
+	Text        string    `json:"text"`
+	OriginScope string    `json:"origin_scope"` // scope the underlying row lives in
 }
 
 // Timeline handles GET /v1/timeline.
@@ -521,7 +529,7 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	for _, e := range events {
 		out = append(out, eventJSON{
 			ID: e.ID, Ts: e.Ts, Source: e.Source, Kind: e.Kind,
-			ActorID: e.ActorID, Text: e.Text,
+			ActorID: e.ActorID, Text: e.Text, OriginScope: e.OriginScope,
 		})
 	}
 	writeJSON(w, out)
@@ -588,6 +596,7 @@ func (s *Server) handleTraverse(w http.ResponseWriter, r *http.Request) {
 			pj.Nodes = append(pj.Nodes, entityJSON{
 				ID: e.EntityID, Type: string(e.EntityType),
 				Key: e.Key, DisplayName: e.DisplayName,
+				Scope:     e.Scope,
 				FirstSeen: e.FirstSeen, LastSeen: e.LastSeen,
 			})
 		}
