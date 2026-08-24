@@ -31,7 +31,7 @@ task demo-seed    # observations + human fact assertions (3 scopes)
 Team-a's connection sees what hunt and threatresp learned:
 
 ```bash
-curl -s 'localhost:8080/v1/enrich?type=ioc_domain&key=secure-portal.invoice-update.com' \
+curl -s 'localhost:8090/v1/enrich?type=ioc_domain&key=secure-portal.invoice-update.com' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | python3 -m json.tool
 ```
 
@@ -43,7 +43,7 @@ observations from tier1 AND threatresp — even though "you" are team-a.
 The Aug-13 restricted note is invisible from any other scope:
 
 ```bash
-curl -s 'localhost:8080/v1/similar?q=executive target variant&k=10' \
+curl -s 'localhost:8090/v1/similar?q=executive target variant&k=10' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a'
 # → no restricted content
 # same query with X-Scope: team-tier1 → present
@@ -52,7 +52,7 @@ curl -s 'localhost:8080/v1/similar?q=executive target variant&k=10' \
 ### 3. Graph traversal across teams
 
 ```bash
-curl -s 'localhost:8080/v1/traverse?type=ioc_domain&key=secure-portal.invoice-update.com&hops=2' \
+curl -s 'localhost:8090/v1/traverse?type=ioc_domain&key=secure-portal.invoice-update.com&hops=2' \
   -H ... | python3 -m json.tool
 ```
 
@@ -64,7 +64,7 @@ Restart the service with `task run-extract`, then POST a *new* note stating a
 fact in prose:
 
 ```bash
-curl -s -X POST localhost:8080/v1/observations \
+curl -s -X POST localhost:8090/v1/observations \
   -H 'Content-Type: application/json' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: analyst-x' -H 'X-Scope: team-hunt' \
   -d '{"kind":"hunt_finding","content":"confirmed 198.51.100.23 resolved_to fallback-c2.phantom-infra.net during rotation"}'
@@ -75,7 +75,7 @@ Within ~30s the extractor proposes `fallback-c2.phantom-infra.net resolved_to
 
 ### 5. Trust model in one flow
 
-Open Swagger (`localhost:8080/swagger/index.html`), authorize nothing, call
+Open Swagger (`localhost:8090/swagger/index.html`), authorize nothing, call
 `POST /v1/facts` with an agent identity → status `proposed`. Promote it with a
 human identity → `active`, org-visible. The audit trail shows both steps.
 

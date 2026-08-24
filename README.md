@@ -41,12 +41,12 @@ lms server start                 # LM Studio with nomic-embed-text-v1.5 loaded
 task run                         # listens on :8080
 
 # 4. Write + read
-curl -s localhost:8080/v1/observations \
+curl -s localhost:8090/v1/observations \
   -H 'Content-Type: application/json' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: analyst-j' -H 'X-Scope: team-a' \
   -d '{"kind":"human_statement","content":"Saw 1.2.3.4 beaconing to evil.example.com"}'
 
-curl -s 'localhost:8080/v1/enrich?type=ioc_ip&key=1.2.3.4' \
+curl -s 'localhost:8090/v1/enrich?type=ioc_ip&key=1.2.3.4' \
   -H 'X-Actor-Type: agent' -H 'X-Actor-ID: triage-bot' -H 'X-Scope: team-a'
 
 # 5. Backfill history / evaluate recall

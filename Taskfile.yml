@@ -34,7 +34,9 @@ tasks:
       - docker compose down -v
 
   run:
-    desc: Run the memory service API
+    desc: Run the memory service API (dev port :8090 — 8080 is taken by another app)
+    env:
+      MEM_LISTEN_ADDR: localhost:8090
     cmds:
       - go run ./cmd/memserved
 
@@ -64,6 +66,7 @@ tasks:
     env:
       MEM_EXTRACT_ENABLED: "true"
       MEM_EXTRACT_MODEL: qwen/qwen3-8b
+      MEM_LISTEN_ADDR: localhost:8090
     cmds:
       - go run ./cmd/memserved
 
