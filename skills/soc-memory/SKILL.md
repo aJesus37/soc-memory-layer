@@ -9,13 +9,14 @@ Shared memory layer for security operations. Every team benefits from every othe
 
 ## Tool Overview
 
-All 5 tools are available via the `soc-memory` MCP server. Identity comes from the connection (env `MEM_MCP_*`), not tool args.
+All 6 tools are available via the `soc-memory` MCP server. Identity comes from the connection (env `MEM_MCP_*`), not tool args.
 
 | Tool | Purpose | When |
 |---|---|---|
 | `memory_enrich` | What do we know about X? Facts + recent observations + neighbors | **Every alert, every IOC** — before deciding |
 | `memory_search` | Hybrid vector+text recall over past notes | Stuck, hunting, or looking for similar cases |
 | `memory_traverse` | Walk the investigation graph N hops | Pivoting between entities |
+| `memory_list_predicates` | List existing predicates with usage counts | **Before inventing a new predicate** — reuse when one fits |
 | `memory_record_observation` | Append an episodic event | After any finding, decision, or action |
 | `memory_assert_fact` | Assert a versioned fact (lands `proposed`, needs human promote) | When you've concluded something durable |
 
@@ -33,7 +34,7 @@ All 5 tools are available via the `soc-memory` MCP server. Identity comes from t
 1. Enrich + search as above
 2. `memory_traverse` from the primary IOC to find connected infrastructure
 3. After each finding: `memory_record_observation` (`investigation_note` / `hunt_finding`)
-4. When you've concluded a durable fact: `memory_assert_fact` (it lands `proposed` — a human promotes it)
+4. When you've concluded a durable fact: `memory_list_predicates` first to reuse an existing predicate when one fits (keep predicates free of judgment — `download_file` not `download_malware`, verdict is a separate `verdict_malicious` fact), then `memory_assert_fact` (it lands `proposed` — a human promotes it)
 
 ### Hunting
 
