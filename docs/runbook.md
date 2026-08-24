@@ -72,7 +72,7 @@ human promote regardless.
 
 | Symptom | Check | Fix |
 |---|---|---|
-| `embedded:false` rows appearing | LM Studio up? `curl localhost:1234/v1/models` | restart model server; rows stay usable (text-only recall) |
+| `embedded:false` rows appearing | Ollama up? `curl localhost:11434/api/tags` | `docker compose restart llm`; rows stay usable (text-only recall) |
 | Similar returns few/no hits | scope correct? embedder up? | text-only degrade logs a warn per search |
 | Traverse empty, enrich works | projection lag or Dgraph down | check watermark vs max(updated_at); `docker compose ps` |
 | Cursor frozen (same page re-projected) | see ADR-007; fixed by toString ordering — verify no raw-UUID comparators crept back | run graphrebuild if divergence confirmed |
