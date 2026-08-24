@@ -723,7 +723,7 @@ func TestTraverseOverHTTP(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if nEnt == 0 && nEdge == 0 {
+		if nEnt == 0 && nEdge.Total() == 0 {
 			break
 		}
 	}

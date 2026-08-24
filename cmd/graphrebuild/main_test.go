@@ -240,8 +240,8 @@ func TestRebuildFromCorruptedGraph(t *testing.T) {
 	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 3 {
 		t.Fatalf("ProjectEntities = (%d, %v), want (3, nil)", n, err)
 	}
-	if n, err := graph.ProjectEdges(ctx, s, conn, 10); err != nil || n != 1 {
-		t.Fatalf("ProjectEdges = (%d, %v), want (1, nil)", n, err)
+	if n, err := graph.ProjectEdges(ctx, s, conn, 10); err != nil || n.Processed != 1 {
+		t.Fatalf("ProjectEdges = (%+v, %v), want processed 1", n, err)
 	}
 
 	uids := fetchUIDs(t, s, ctx, seeded...)
@@ -282,8 +282,11 @@ func TestRebuildFromCorruptedGraph(t *testing.T) {
 	if entities != 3 {
 		t.Errorf("rebuild projected %d entities, want 3", entities)
 	}
-	if edges != 1 {
-		t.Errorf("rebuild processed %d edge rows, want 1", edges)
+	if edges.Processed != 1 {
+		t.Errorf("rebuild processed %d edge rows, want 1", edges.Processed)
+	}
+	if edges.DeletedOrphans != 0 || edges.Deferred != 0 {
+		t.Errorf("rebuild edge stats = %+v, want no orphans or deferrals", edges)
 	}
 
 	// Junk gone: nothing in CH backs it, DropData erased it, replay cannot

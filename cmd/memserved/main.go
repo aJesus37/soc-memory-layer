@@ -200,14 +200,15 @@ func projectTick(ctx context.Context, logger *slog.Logger, g *graph.Store, conn 
 		logger.Info("entities projected", "count", nEnt)
 	}
 
-	nEdge, err := graph.ProjectEdges(ctx, g, conn, 0)
+	stEdge, err := graph.ProjectEdges(ctx, g, conn, 0)
 	switch {
 	case err != nil && ctx.Err() != nil: // shutdown raced the tick
 	case err != nil:
 		logger.Error("edge projection failed; will retry next tick",
-			"processed_before_err", nEdge, "err", err)
-	case nEdge > 0:
-		logger.Info("edges projected", "count", nEdge)
+			"processed_before_err", stEdge.Processed, "err", err)
+	case stEdge.Total() > 0:
+		logger.Info("edges projected", "processed", stEdge.Processed,
+			"orphans_deleted", stEdge.DeletedOrphans, "deferred", stEdge.Deferred)
 	}
 }
 

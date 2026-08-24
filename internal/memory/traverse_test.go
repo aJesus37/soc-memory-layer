@@ -95,7 +95,7 @@ func drainProjections(t *testing.T, ctx context.Context, g *graph.Store, conn dr
 		if err != nil {
 			t.Fatalf("ProjectEdges: %v", err)
 		}
-		if nEnt == 0 && nEdge == 0 {
+		if nEnt == 0 && nEdge.Total() == 0 {
 			return
 		}
 	}

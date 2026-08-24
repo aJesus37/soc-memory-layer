@@ -152,6 +152,73 @@ func readWatermarkValue(t *testing.T, ctx context.Context, conn driver.Conn, nam
 	return ts
 }
 
+// readWatermarkCursor reads one named cursor's exact (ts, last_id) pair;
+// single logical row per name, so max() reads that row's values.
+func readWatermarkCursor(t *testing.T, ctx context.Context, conn driver.Conn, name string) (time.Time, string) {
+	t.Helper()
+	var (
+		ts     time.Time
+		lastID string
+	)
+	if err := conn.QueryRow(ctx,
+		"SELECT max(ts), max(last_id) FROM mem.projection_watermark WHERE name = ?", name).
+		Scan(&ts, &lastID); err != nil {
+		t.Fatalf("read %s watermark: %v", name, err)
+	}
+	return ts, lastID
+}
+
+// insertRawEntity plants one mem.entities row directly, bypassing the
+// resolver — used to craft deterministic endpoint-presence scenarios.
+func insertRawEntity(t *testing.T, ctx context.Context, conn driver.Conn,
+	id uuid.UUID, scope, key, entityType string, updatedAt time.Time) {
+	t.Helper()
+	b, err := conn.PrepareBatch(ctx,
+		"INSERT INTO mem.entities "+
+			"(entity_id, scope, entity_type, key, display_name, attrs, first_seen, last_seen, updated_at)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Append(id, scope, entityType, key, key,
+		map[string]string{}, updatedAt, updatedAt, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Send(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// insertRawEdge plants one OPEN mem.edges row directly (valid_to sentinel),
+// bypassing the writer — used to craft deterministic edge scenarios.
+func insertRawEdge(t *testing.T, ctx context.Context, conn driver.Conn,
+	id, src, dst uuid.UUID, scope, relation string, updatedAt time.Time) {
+	t.Helper()
+	b, err := conn.PrepareBatch(ctx,
+		"INSERT INTO mem.edges "+
+			"(edge_id, scope, src_id, dst_id, relation, from_fact, valid_from, valid_to, updated_at)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Append(id, scope, src, dst, relation,
+		uuid.Nil, updatedAt, time.Date(2105, 12, 31, 23, 59, 59, 0, time.UTC), updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Send(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// countEdgesByID counts live mem.edges rows carrying one edge_id.
+func countEdgesByID(t *testing.T, ctx context.Context, conn driver.Conn, id uuid.UUID) int {
+	t.Helper()
+	var n uint64
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.edges WHERE edge_id = ?", id).Scan(&n); err != nil {
+		t.Fatalf("count edge %s: %v", id, err)
+	}
+	return int(n)
+}
+
 func TestProjectEntities(t *testing.T) {
 	ctx := itestCtx(t)
 	s, conn := itestBoth(t)
@@ -434,8 +501,8 @@ func TestProjectEdges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProjectEdges: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("first edge projection processed %d rows, want 1", n)
+	if n.Processed != 1 {
+		t.Fatalf("first edge projection processed %d rows, want 1", n.Processed)
 	}
 	out, ok := fetchOutgoing(t, s, ctx, eSubj.EntityID)
 	if !ok || len(out.RelatedTo) != 1 {
@@ -470,8 +537,8 @@ func TestProjectEdges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("supersede ProjectEdges: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("supersede projection processed %d rows, want 2 (closed prior + new)", n)
+	if n.Processed != 2 {
+		t.Fatalf("supersede projection processed %d rows, want 2 (closed prior + new)", n.Processed)
 	}
 	out, _ = fetchOutgoing(t, s, ctx, eSubj.EntityID)
 	if len(out.RelatedTo) != 1 {
@@ -494,8 +561,8 @@ func TestProjectEdges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retract ProjectEdges: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("retract projection processed %d rows, want 1", n)
+	if n.Processed != 1 {
+		t.Fatalf("retract projection processed %d rows, want 1", n.Processed)
 	}
 	out, _ = fetchOutgoing(t, s, ctx, eSubj.EntityID)
 	if len(out.RelatedTo) != 0 {
@@ -507,8 +574,8 @@ func TestProjectEdges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drained ProjectEdges: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("drained replay processed %d rows, want 0", n)
+	if n.Total() != 0 {
+		t.Fatalf("drained replay processed %d rows, want 0", n.Total())
 	}
 }
 
@@ -531,22 +598,26 @@ func TestProjectEdgesBatch(t *testing.T) {
 	// Two projectable edges: distinct predicates so neither supersedes the
 	// other. Each mints one open mem.edges row via the real writer.
 	assertFactWithObject(t, svc, scope, eSubj.EntityID, "communicates_with", "x", eObj1.EntityID)
+	time.Sleep(5 * time.Millisecond) // pin pagination order across the three edges
 	assertFactWithObject(t, svc, scope, eSubj.EntityID, "resolves_to", "y", eObj2.EntityID)
+	time.Sleep(5 * time.Millisecond)
 
-	// Third edge whose dst entity deliberately has NO projected node:
-	// the projector must skip it (never dangling-create) AND still advance
-	// the cursor past it, or batch progression wedges forever.
+	// Third edge whose dst entity deliberately has NO projected node: the
+	// pre-fix projector skipped it AND advanced the cursor past it,
+	// permanently losing the edge whenever projection lagged. It must now
+	// DEFER — hold the cursor just before itself — until ProjectEntities
+	// catches up on a later tick.
 	eLate := seedEntity(t, ctx, conn, scope, "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855")
 	assertFactWithObject(t, svc, scope, eSubj.EntityID, "drops", "z", eLate.EntityID)
 
 	wmPrev := readWatermarkValue(t, ctx, conn, wmEdges)
-	for i, wantN := range []int{1, 1, 1, 0} {
+	for i, wantN := range []int{1, 1} {
 		n, err := graph.ProjectEdges(ctx, s, conn, 1)
 		if err != nil {
 			t.Fatalf("step %d: ProjectEdges: %v", i, err)
 		}
-		if n != wantN {
-			t.Errorf("step %d processed %d rows, want %d", i, n, wantN)
+		if n.Processed != wantN {
+			t.Errorf("step %d processed %d rows, want %d", i, n.Processed, wantN)
 		}
 		wmNow := readWatermarkValue(t, ctx, conn, wmEdges)
 		if wmNow.Before(wmPrev) {
@@ -555,21 +626,61 @@ func TestProjectEdgesBatch(t *testing.T) {
 		wmPrev = wmNow
 	}
 
+	// The unprojectable head edge defers: zero progress, cursor pinned.
+	statsDeferred, err := graph.ProjectEdges(ctx, s, conn, 1)
+	if err != nil {
+		t.Fatalf("deferring ProjectEdges: %v", err)
+	}
+	if statsDeferred.Processed != 0 || statsDeferred.DeletedOrphans != 0 || statsDeferred.Deferred != 1 {
+		t.Fatalf("deferral stats = %+v, want exactly one deferred row and no other movement", statsDeferred)
+	}
+	wmDeferred := readWatermarkValue(t, ctx, conn, wmEdges)
+	if !wmDeferred.Equal(wmPrev) {
+		t.Errorf("cursor advanced past deferred edge: %v -> %v", wmPrev, wmDeferred)
+	}
+
+	// No dangling node may appear for the unprojected endpoint.
 	nodes := fetchNodes(t, s, ctx, all...)
 	if len(nodes) != 3 {
-		t.Fatalf("node count = %d, want 3 (skip path must not create nodes)", len(nodes))
+		t.Fatalf("node count = %d, want 3 (deferral must not create nodes)", len(nodes))
+	}
+	if late := fetchNodes(t, s, ctx, eLate.EntityID); len(late) != 0 {
+		t.Errorf("dangling node created for unprojected endpoint: %+v", late)
+	}
+
+	// Heal: the next entity tick projects the missing node, and the pinned
+	// edge then links on the following edge tick — self-healing, no loss.
+	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 1 {
+		t.Fatalf("healing ProjectEntities = (%d, %v), want (1, nil)", n, err)
+	}
+	statsFinal, err := graph.ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("healed ProjectEdges: %v", err)
+	}
+	if statsFinal.Processed != 1 || statsFinal.Deferred != 0 || statsFinal.DeletedOrphans != 0 {
+		t.Fatalf("healed stats = %+v, want the deferred edge processed once", statsFinal)
+	}
+
+	nodes = fetchNodes(t, s, ctx, all...)
+	if len(nodes) != 3 {
+		t.Fatalf("node count after heal = %d, want 3", len(nodes))
 	}
 	out, ok := fetchOutgoing(t, s, ctx, eSubj.EntityID)
-	if !ok || len(out.RelatedTo) != 2 {
-		t.Fatalf("outgoing after batch drain = %+v, want 2 links", out)
+	if !ok || len(out.RelatedTo) != 3 {
+		t.Fatalf("outgoing after heal = %+v, want 3 links", out)
 	}
-	targets := map[string]bool{}
+	targets := map[string]string{}
 	for _, r := range out.RelatedTo {
-		targets[r.ChID] = true
+		targets[r.ChID] = r.FacetRelation
 	}
-	if !targets[eObj1.EntityID] || !targets[eObj2.EntityID] {
-		t.Errorf("targets %v missing expected endpoints %s / %s",
-			targets, eObj1.EntityID, eObj2.EntityID)
+	for id, rel := range map[string]string{
+		eObj1.EntityID: "communicates_with",
+		eObj2.EntityID: "resolves_to",
+		eLate.EntityID: "drops",
+	} {
+		if targets[id] != rel {
+			t.Errorf("target %s relation = %q, want %q", id, targets[id], rel)
+		}
 	}
 }
 
@@ -632,8 +743,8 @@ func TestProjectEdgesTiebreakerOrderRegression(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step %d: ProjectEdges: %v", i, err)
 		}
-		total += n
-		if n == 0 {
+		total += n.Processed
+		if n.Total() == 0 {
 			drained = true
 			break
 		}
@@ -722,4 +833,168 @@ func mustParseUUID(t *testing.T, s string) uuid.UUID {
 		t.Fatalf("parse uuid %q: %v", s, err)
 	}
 	return u
+}
+
+// Regression for the live permanent-skip bug: an edge whose endpoints exist
+// in ClickHouse but have no Dgraph nodes yet must DEFER — the cursor holds
+// just before the edge and the batch stops — never skip-and-advance. The
+// setup replays the live failure shape: endpoint rows planted upstream by
+// raw SQL, ProjectEdges invoked while entities are still unprojected, then
+// healing once the entity projector catches up.
+func TestProjectEdgesDefersUntilEndpointsProjected(t *testing.T) {
+	ctx := itestCtx(t)
+	s, conn := itestBoth(t)
+
+	scope := fmt.Sprintf("itest-defer-%x", time.Now().UnixNano())
+	srcID := mustParseUUID(t, "11111111-1111-4111-8111-111111111111")
+	dstID := mustParseUUID(t, "22222222-2222-4222-8222-222222222222")
+	edgeID := mustParseUUID(t, "33333333-3333-4333-8333-333333333333")
+
+	// Endpoints exist UPSTREAM only (raw INSERTs); nothing is projected.
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	insertRawEntity(t, ctx, conn, srcID, scope, "defer-src.example.com", "ioc_domain", base)
+	insertRawEntity(t, ctx, conn, dstID, scope, "defer-dst.example.net", "ioc_domain",
+		base.Add(time.Millisecond))
+	insertRawEdge(t, ctx, conn, edgeID, srcID, dstID, scope, "communicates_with",
+		base.Add(2*time.Millisecond))
+
+	// 1. Entities lagging (no Dgraph nodes yet): the edge must defer with
+	// zero progress and the cursor must stay at epoch — NOT advance past
+	// the edge.
+	statsDeferred, err := graph.ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("deferred ProjectEdges: %v", err)
+	}
+	if statsDeferred.Processed != 0 || statsDeferred.DeletedOrphans != 0 || statsDeferred.Deferred != 1 {
+		t.Fatalf("stats = %+v, want exactly one deferred row", statsDeferred)
+	}
+	ts, lastID := readWatermarkCursor(t, ctx, conn, wmEdges)
+	if ts.UnixMilli() != 0 || lastID != "" {
+		t.Fatalf("cursor advanced past deferred edge: (%v, %q), want epoch/empty", ts, lastID)
+	}
+
+	// The stall is stable: a repeated tick defers again without moving.
+	statsAgain, err := graph.ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("repeated deferred ProjectEdges: %v", err)
+	}
+	if statsAgain.Deferred != 1 || statsAgain.Processed != 0 {
+		t.Fatalf("repeat stats = %+v, want the same single deferral", statsAgain)
+	}
+
+	// No dangling node creation for either endpoint.
+	if nodes := fetchNodes(t, s, ctx, srcID.String(), dstID.String()); len(nodes) != 0 {
+		t.Fatalf("dangling nodes created: %+v", nodes)
+	}
+
+	// 2. The entity projector ticks: both nodes appear.
+	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 2 {
+		t.Fatalf("ProjectEntities = (%d, %v), want (2, nil)", n, err)
+	}
+	nodes := fetchNodes(t, s, ctx, srcID.String(), dstID.String())
+	if len(nodes) != 2 {
+		t.Fatalf("healed node count = %d, want 2: %+v", len(nodes), nodes)
+	}
+
+	// 3. The pinned edge now links in Dgraph from the untouched position.
+	statsHealed, err := graph.ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("healed ProjectEdges: %v", err)
+	}
+	if statsHealed.Processed != 1 || statsHealed.Deferred != 0 || statsHealed.DeletedOrphans != 0 {
+		t.Fatalf("healed stats = %+v, want the deferred edge processed once", statsHealed)
+	}
+	out, ok := fetchOutgoing(t, s, ctx, srcID.String())
+	if !ok || len(out.RelatedTo) != 1 {
+		t.Fatalf("outgoing after heal = %+v (ok=%v), want the linked edge", out, ok)
+	}
+	if got := out.RelatedTo[0].ChID; got != dstID.String() {
+		t.Errorf("linked target = %s, want %s", got, dstID.String())
+	}
+	if out.RelatedTo[0].FacetRelation != "communicates_with" {
+		t.Errorf("relation facet = %q, want communicates_with", out.RelatedTo[0].FacetRelation)
+	}
+	_, lastID = readWatermarkCursor(t, ctx, conn, wmEdges)
+	if lastID != edgeID.String() {
+		t.Errorf("cursor last_id = %q, want past the healed edge %s", lastID, edgeID)
+	}
+}
+
+// Orphan edges — endpoints absent from mem.entities FINAL altogether — are
+// derived-state garbage (ADR-001): the row must be DELETED from ClickHouse
+// and the cursor advanced normally past it, never deferred forever. Covers
+// all three detection shapes: both endpoints missing, one endpoint present-
+// upstream-but-unprojected, and one endpoint already resolved to a uid.
+func TestProjectEdgesDeletesOrphans(t *testing.T) {
+	ctx := itestCtx(t)
+	s, conn := itestBoth(t)
+
+	scope := fmt.Sprintf("itest-orphan-%x", time.Now().UnixNano())
+	const (
+		ghostA = "44444444-4444-4444-8444-444444444444" // never inserted anywhere
+		ghostB = "55555555-5555-4555-8555-555555555555" // never inserted anywhere
+		realID = "66666666-6666-4666-8666-666666666666" // planted upstream only
+	)
+	eA := mustParseUUID(t, "77777777-7777-4777-8777-777777777777") // ghostA -> ghostB
+	eB := mustParseUUID(t, "88888888-8888-4888-8888-888888888888") // real   -> ghostB
+
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	insertRawEdge(t, ctx, conn, eA,
+		mustParseUUID(t, ghostA), mustParseUUID(t, ghostB), scope, "resolves_to", base)
+	insertRawEntity(t, ctx, conn, mustParseUUID(t, realID),
+		scope, "orphan-src.example.com", "ioc_ip", base.Add(time.Millisecond))
+	insertRawEdge(t, ctx, conn, eB,
+		mustParseUUID(t, realID), mustParseUUID(t, ghostB), scope, "communicates_with",
+		base.Add(2*time.Millisecond))
+
+	// Only the real entity projects; the ghosts stay absent everywhere.
+	if n, err := graph.ProjectEntities(ctx, s, conn, 10); err != nil || n != 1 {
+		t.Fatalf("ProjectEntities = (%d, %v), want (1, nil)", n, err)
+	}
+
+	stats, err := graph.ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("orphan ProjectEdges: %v", err)
+	}
+	if stats.Processed != 0 || stats.DeletedOrphans != 2 || stats.Deferred != 0 {
+		t.Fatalf("stats = %+v, want both rows deleted as orphans", stats)
+	}
+
+	for _, id := range []uuid.UUID{eA, eB} {
+		if n := countEdgesByID(t, ctx, conn, id); n != 0 {
+			t.Errorf("orphan edge %s still in mem.edges (%d rows)", id, n)
+		}
+	}
+	// Orphan GC touches only mem.edges: the real entity row survives...
+	var ents uint64
+	if err := conn.QueryRow(ctx,
+		"SELECT count() FROM mem.entities FINAL WHERE entity_id = ?",
+		mustParseUUID(t, realID)).Scan(&ents); err != nil {
+		t.Fatal(err)
+	}
+	if ents != 1 {
+		t.Errorf("real entity row count = %d, want 1 (only edges may be deleted)", ents)
+	}
+	// ...and its projected node carries no link to the shared ghost.
+	if out, ok := fetchOutgoing(t, s, ctx, realID); ok && len(out.RelatedTo) != 0 {
+		t.Errorf("resolved-src orphan left a triple behind: %+v", out.RelatedTo)
+	}
+	if ghosts := fetchNodes(t, s, ctx, ghostA, ghostB); len(ghosts) != 0 {
+		t.Errorf("ghost nodes materialized: %+v", ghosts)
+	}
+
+	// Cursor advanced normally PAST both deleted rows (eB sorts last).
+	ts, lastID := readWatermarkCursor(t, ctx, conn, wmEdges)
+	if ts.UnixMilli() < base.Add(2*time.Millisecond).UnixMilli() || lastID != eB.String() {
+		t.Fatalf("cursor after orphan pass = (%v, %q), want at/past eB %s", ts, lastID, eB)
+	}
+
+	// Drained replay: nothing left to do, nothing rewritten.
+	statsAgain, err := graph.ProjectEdges(ctx, s, conn, 10)
+	if err != nil {
+		t.Fatalf("drained replay: %v", err)
+	}
+	if statsAgain.Total() != 0 {
+		t.Fatalf("drained replay stats = %+v, want zero activity", statsAgain)
+	}
 }

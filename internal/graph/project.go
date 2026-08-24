@@ -280,12 +280,61 @@ func formatCHTimestamp(ts time.Time) string {
 	return ts.UTC().Format("2006-01-02 15:04:05.000")
 }
 
+// EdgeProjectionStats breaks one ProjectEdges call down by outcome class,
+// so callers can tell progress from a deferral stall.
+type EdgeProjectionStats struct {
+	// Processed counts edge rows whose Dgraph mutation committed this
+	// call: open edges upserted plus closed edges deleted.
+	Processed int
+	// DeletedOrphans counts edge rows removed from mem.edges because at
+	// least one endpoint does not exist in mem.entities FINAL — a deleted
+	// or never-existing reference that can never become projectable
+	// (derived state; ADR-001 keeps truth upstream in ClickHouse).
+	DeletedOrphans int
+	// Deferred is 1 when the batch stopped on an edge whose endpoints all
+	// exist in ClickHouse but not yet as Dgraph nodes. The cursor stops
+	// just before that edge, so it is retried next tick.
+	Deferred int
+}
+
+// Total is the number of source rows this call consumed from mem.edges:
+// applied, orphan-deleted and deferred rows together.
+func (s EdgeProjectionStats) Total() int {
+	return s.Processed + s.DeletedOrphans + s.Deferred
+}
+
 // ProjectEdges projects mem.edges changes into Dgraph related_to edges with
 // facets. Open edges (valid_to in the future) upsert the src->dst triple
 // with relation/valid_from/valid_to facets; closed edges (valid_to <= now)
-// delete the triple. It returns the number of edge rows processed this call
-// (including rows skipped for a missing endpoint node); batch bounds the
-// page size; values <= 0 select defaultBatch.
+// delete the triple. It returns per-outcome counts for this call; batch
+// bounds the page size; values <= 0 select defaultBatch.
+//
+// # Endpoint state machine (correctness-critical)
+//
+// Rows are visited in pagination order and each falls into exactly one
+// class, decided by its two endpoints:
+//
+//  1. RESOLVED — both ch_ids map to projected Dgraph nodes: apply the
+//     open/closed mutation to the triple, count Processed, cursor may pass.
+//  2. ORPHAN — at least one endpoint has NO row in mem.entities FINAL: the
+//     edge references deleted or never-existing entities and can never
+//     become projectable. DELETE the mem.edges row (derived state; ADR-001
+//     keeps truth upstream), log info with ids only, count DeletedOrphans,
+//     advance normally past it.
+//  3. DEFERRABLE — every endpoint missing a node still exists in
+//     mem.entities FINAL (ProjectEntities merely lagging): DO NOT advance
+//     past it. Set the cursor to just BEFORE this edge (the previous
+//     handled row's position; unchanged when it is the page head) and stop
+//     the batch — remaining rows stay pending. projectTick runs
+//     ProjectEntities before ProjectEdges every tick, so the missing node
+//     appears by the next tick and the edge replays: projection lag heals
+//     itself instead of permanently skipping the edge (pre-fix behavior
+//     skipped AND advanced, silently losing the edge forever). Count
+//     Deferred = 1.
+//
+// Endpoint existence is checked against ClickHouse in ONE grouped query for
+// all unresolved ch_ids of the page, so classification costs at most one
+// extra scan regardless of page size.
 //
 // # MODELING CONSTRAINT: one relation per (src,dst) pair
 //
@@ -300,10 +349,12 @@ func formatCHTimestamp(ts time.Time) string {
 //
 // Watermark invariant: identical composite-cursor mechanics as
 // ProjectEntities — pages read WHERE (updated_at, toString(edge_id)) > (?, ?)
-// in a deterministic total order; the cursor advances to the last row only
-// after
-// the Dgraph write commits; any earlier error returns before advancement
-// and replays the page harmlessly.
+// in a deterministic total order; the cursor advances only after the
+// Dgraph write commits and the orphan deletions return; any earlier error
+// returns before advancement and replays the page harmlessly (edge upserts
+// are idempotent, orphan deletes idempotent-by-absence). A deferral-stopped
+// call advances at most to the last handled row, never past the deferred
+// edge.
 //
 // Closure visibility is what makes this correct at all: mem.edges closures
 // are MUTATIONS that leave the row physically in place, so the writers bump
@@ -311,47 +362,115 @@ func formatCHTimestamp(ts time.Time) string {
 // a fresh position in the pagination order that a cursor which already
 // passed the original insert can still see.
 //
-// Rows whose endpoints have no projected node (ProjectEntities lagging) are
-// skipped with a debug log and NOT retried — the cursor moves past them;
-// the next touch of the underlying fact re-mints or re-closes the edge row
-// and it re-enters the order. Retry-duplicated edge rows converge:
-// replaying an open edge re-sets the identical triple and facets.
-func ProjectEdges(ctx context.Context, st *Store, conn driver.Conn, batch int) (int, error) {
+// Known wedge outside normal operation: if nodes vanish from Dgraph while
+// their entity rows remain (DropData without watermark reset), edges defer
+// forever because the entities cursor will not revisit them. That state is
+// loud (Deferred=1 every tick, info logs) and repaired exactly like any
+// other lost projection: graphrebuild or a watermark reset + replay.
+func ProjectEdges(ctx context.Context, st *Store, conn driver.Conn, batch int) (EdgeProjectionStats, error) {
+	var stats EdgeProjectionStats
 	if batch <= 0 {
 		batch = defaultBatch
 	}
 	if st == nil || conn == nil {
-		return 0, errors.New("graph: project edges: nil store or connection")
+		return stats, errors.New("graph: project edges: nil store or connection")
 	}
 
 	ts, lastID, exists, err := readCursor(ctx, conn, watermarkEdges)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
 	if lastID == "" {
 		lastID = nilUUID
 	}
 	page, err := queryEdgeRows(ctx, conn, ts, lastID, batch)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
 	if len(page) == 0 {
-		return 0, nil
+		return stats, nil
 	}
-	if err := applyEdgePage(ctx, st.Dgraph(), page); err != nil {
-		return 0, err
-	}
-	last := page[len(page)-1]
-	lastID = last.EdgeID.String()
-	if exists {
-		err = updateCursor(ctx, conn, watermarkEdges, last.UpdatedAt, lastID)
-	} else {
-		err = seedCursor(ctx, conn, watermarkEdges, last.UpdatedAt, lastID)
-	}
+
+	uids, err := resolveNodeUIDs(ctx, st.Dgraph(), page)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
-	return len(page), nil
+	existing, err := existingEntityIDs(ctx, conn, unresolvedEndpoints(page, uids))
+	if err != nil {
+		return stats, err
+	}
+
+	var setBuf, delBuf bytes.Buffer
+	var orphanIDs []uuid.UUID
+	deferAt := -1 // page index of the deferrable edge that stopped the batch
+	now := time.Now()
+	for i := range page {
+		e := &page[i]
+		srcUID, okSrc := uids[e.SrcID.String()]
+		dstUID, okDst := uids[e.DstID.String()]
+		switch {
+		case okSrc && okDst: // class 1: RESOLVED
+			if e.ValidTo.After(now) {
+				fmt.Fprintf(&setBuf, "<%s> <related_to> <%s> (relation=%q,"+
+					"valid_from=%q,valid_to=%q) .\n",
+					srcUID, dstUID, e.Relation,
+					e.ValidFrom.UTC().Format(time.RFC3339),
+					e.ValidTo.UTC().Format(time.RFC3339))
+			} else {
+				fmt.Fprintf(&delBuf, "<%s> <related_to> <%s> .\n", srcUID, dstUID)
+			}
+			stats.Processed++
+		case !endpointsExist(e, uids, existing): // class 2: ORPHAN
+			slog.Info("graph: deleting orphan edge (endpoint absent from clickhouse)",
+				"edge_id", e.EdgeID,
+				"src_id", e.SrcID,
+				"dst_id", e.DstID)
+			orphanIDs = append(orphanIDs, e.EdgeID)
+			stats.DeletedOrphans++
+		default: // class 3: DEFERRABLE — stop the batch just before this row
+			slog.Info("graph: deferring edge pending endpoint projection",
+				"edge_id", e.EdgeID,
+				"src_id", e.SrcID,
+				"dst_id", e.DstID,
+				"relation", e.Relation)
+			stats.Deferred++
+			deferAt = i
+		}
+		if deferAt >= 0 {
+			break
+		}
+	}
+
+	if setBuf.Len() > 0 || delBuf.Len() > 0 {
+		if err := applyEdgeMutations(ctx, st.Dgraph(), &setBuf, &delBuf); err != nil {
+			return stats, err
+		}
+	}
+	if err := deleteOrphanEdges(ctx, conn, orphanIDs); err != nil {
+		return stats, err
+	}
+
+	advance := func(t time.Time, id string) error {
+		if exists {
+			return updateCursor(ctx, conn, watermarkEdges, t, id)
+		}
+		return seedCursor(ctx, conn, watermarkEdges, t, id)
+	}
+	switch {
+	case deferAt > 0: // stop ON the previous handled row's position
+		prev := &page[deferAt-1]
+		if err := advance(prev.UpdatedAt, prev.EdgeID.String()); err != nil {
+			return stats, err
+		}
+	case deferAt == 0: // nothing handled; leave the stored cursor untouched
+		return stats, nil
+	default: // full page handled; advance to the last row as usual
+		last := &page[len(page)-1]
+		if err := advance(last.UpdatedAt, last.EdgeID.String()); err != nil {
+			return stats, err
+		}
+	}
+	return stats, nil
 }
 
 // chEdge is one mem.edges row exactly as needed for projection. Edges are
@@ -390,49 +509,18 @@ func queryEdgeRows(ctx context.Context, conn driver.Conn, ts time.Time, lastID s
 	return out, nil
 }
 
-// applyEdgePage applies one page as a single atomic Dgraph transaction:
-// all SET nquads (open edges) plus all DELETE nquads (closed edges) commit
-// together or not at all, so a crash mid-page replays the whole page.
+// applyEdgeMutations applies the page's accumulated nquads as a single
+// atomic Dgraph transaction: all SET (open edges) plus all DELETE (closed
+// edges) commit together or not at all, so a crash mid-page replays the
+// whole page.
 //
-// Endpoints resolve by ch_id in ONE batched eq() lookup — nodes MUST
-// already exist via ProjectEntities; missing endpoints are logged at debug
-// level and skipped (never created dangling). Facets use SINGLE parentheses
-// — the only NQuads facet syntax dgo v250 accepts (double parens fail with
-// "Invalid input: )" at lex time, re-verified against live Dgraph v25) —
-// with quoted string values carrying RFC3339 timestamps that read back
-// verbatim under @facets sub-selections.
-func applyEdgePage(ctx context.Context, c *dgo.Dgraph, page []chEdge) error {
-	uids, err := resolveNodeUIDs(ctx, c, page)
-	if err != nil {
-		return err
-	}
-
-	var setBuf, delBuf bytes.Buffer
-	now := time.Now()
-	for _, e := range page {
-		srcUID, okSrc := uids[e.SrcID.String()]
-		dstUID, okDst := uids[e.DstID.String()]
-		if !okSrc || !okDst {
-			slog.Debug("graph: skip edge with unprojected endpoint",
-				"edge_id", e.EdgeID,
-				"src_id", e.SrcID,
-				"dst_id", e.DstID,
-				"relation", e.Relation)
-			continue
-		}
-		if e.ValidTo.After(now) {
-			fmt.Fprintf(&setBuf, "<%s> <related_to> <%s> (relation=%q,"+
-				"valid_from=%q,valid_to=%q) .\n",
-				srcUID, dstUID, e.Relation,
-				e.ValidFrom.UTC().Format(time.RFC3339),
-				e.ValidTo.UTC().Format(time.RFC3339))
-		} else {
-			fmt.Fprintf(&delBuf, "<%s> <related_to> <%s> .\n", srcUID, dstUID)
-		}
-	}
-
+// Facets use SINGLE parentheses — the only NQuads facet syntax dgo v250
+// accepts (double parens fail with "Invalid input: )" at lex time,
+// re-verified against live Dgraph v25) — with quoted string values carrying
+// RFC3339 timestamps that read back verbatim under @facets sub-selections.
+func applyEdgeMutations(ctx context.Context, c *dgo.Dgraph, setBuf, delBuf *bytes.Buffer) error {
 	if setBuf.Len() == 0 && delBuf.Len() == 0 {
-		return nil // every row skipped; nothing to mutate
+		return nil // nothing to mutate
 	}
 	req := &api.Request{CommitNow: true}
 	if setBuf.Len() > 0 {
@@ -445,6 +533,97 @@ func applyEdgePage(ctx context.Context, c *dgo.Dgraph, page []chEdge) error {
 	defer txn.Discard(context.WithoutCancel(ctx))
 	if _, err := txn.Do(ctx, req); err != nil {
 		return fmt.Errorf("graph: apply edge page: %w", err)
+	}
+	return nil
+}
+
+// unresolvedEndpoints collects the distinct ch_ids among the page's src/dst
+// pairs that resolveNodeUIDs could not map to a projected node. These are
+// exactly the ids the orphan-vs-deferrable classification must check
+// against ClickHouse truth.
+func unresolvedEndpoints(page []chEdge, uids map[string]string) []uuid.UUID {
+	seen := make(map[string]bool)
+	var out []uuid.UUID
+	add := func(id uuid.UUID) {
+		s := id.String()
+		if _, ok := uids[s]; !ok && !seen[s] {
+			seen[s] = true
+			out = append(out, id)
+		}
+	}
+	for i := range page {
+		add(page[i].SrcID)
+		add(page[i].DstID)
+	}
+	return out
+}
+
+// endpointsExist reports whether every endpoint of e lacking a projected
+// node has an entity row in mem.entities FINAL. Endpoints that DID resolve
+// need no check — their uid came from a projection of that same truth.
+func endpointsExist(e *chEdge, uids map[string]string, existing map[string]bool) bool {
+	for _, id := range []uuid.UUID{e.SrcID, e.DstID} {
+		if _, ok := uids[id.String()]; ok {
+			continue
+		}
+		if !existing[id.String()] {
+			return false
+		}
+	}
+	return true
+}
+
+// existingEntityIDs reports which of the given ch_ids have at least one row
+// in mem.entities FINAL. ONE grouped query covers the whole page's
+// unresolved subset, so a call costs at most one extra ClickHouse scan
+// regardless of how many rows await orphan-vs-deferrable classification.
+// Explicit toUUID() casts pin the literal comparison to UUID semantics.
+func existingEntityIDs(ctx context.Context, conn driver.Conn, ids []uuid.UUID) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	literals := make([]string, len(ids))
+	for i, id := range ids {
+		literals[i] = fmt.Sprintf("toUUID('%s')", id)
+	}
+	rows, err := conn.Query(ctx,
+		"SELECT DISTINCT toString(entity_id) FROM mem.entities FINAL "+
+			"WHERE entity_id IN ("+strings.Join(literals, ", ")+")")
+	if err != nil {
+		return nil, fmt.Errorf("graph: probe endpoint entities: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("graph: scan endpoint entity id: %w", err)
+		}
+		out[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("graph: iterate endpoint entity ids: %w", err)
+	}
+	return out, nil
+}
+
+// deleteOrphanEdges removes edge rows whose endpoints do not exist in
+// mem.entities from ClickHouse itself. Edges are derived state (ADR-001:
+// truth lives upstream in facts/entities), so a reference to an entity that
+// is gone is garbage to collect, not data to preserve. mutations_sync=1
+// makes a returned error mean the rows still stand.
+func deleteOrphanEdges(ctx context.Context, conn driver.Conn, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	literals := make([]string, len(ids))
+	for i, id := range ids {
+		literals[i] = fmt.Sprintf("toUUID('%s')", id)
+	}
+	if err := conn.Exec(ctx,
+		"ALTER TABLE mem.edges DELETE WHERE edge_id IN ("+strings.Join(literals, ", ")+") "+
+			"SETTINGS mutations_sync = 1"); err != nil {
+		return fmt.Errorf("graph: delete orphan edges: %w", err)
 	}
 	return nil
 }
