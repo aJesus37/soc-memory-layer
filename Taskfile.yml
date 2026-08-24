@@ -1,5 +1,7 @@
 version: '3'
 
+dotenv: ['.env']
+
 vars:
   TEST_ENV: MEM_TEST_CH_ADDR=localhost:9000,MEM_TEST_DGRAPH_ADDR=localhost:9080
 
