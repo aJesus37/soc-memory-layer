@@ -24,8 +24,8 @@ services:
       timeout: 3s
       retries: 20
   embedder:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8.2
-    command: --model-id nomic-ai/nomic-embed-text-v1.5 --port 3000 --hostname 0.0.0.0
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    command: --model-id BAAI/bge-base-en-v1.5 --port 3000 --hostname 0.0.0.0 --max-client-batch-size 32
     ports: ["3000:3000"]
     volumes:
       - tei_data:/data

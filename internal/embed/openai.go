@@ -105,7 +105,10 @@ func isNotFound(err error) bool {
 }
 
 func (c *OpenAI) doOpenAIEmbed(ctx context.Context, kind string, texts []string) ([][]float32, error) {
-	prefix := prefixForKind(kind)
+	prefix := ""
+	if c.shouldPrefix() {
+		prefix = prefixForKind(kind)
+	}
 	input := make([]string, len(texts))
 	for i, t := range texts {
 		input[i] = prefix + t
@@ -168,8 +171,17 @@ func prefixForKind(kind string) string {
 	}
 }
 
+// shouldPrefix reports whether the configured model benefits from nomic task
+// prefixes. BGE and other models either ignore them or degrade slightly.
+func (c *OpenAI) shouldPrefix() bool {
+	return c.cfg.Model == "" || strings.Contains(c.cfg.Model, "nomic")
+}
+
 func (c *OpenAI) doTEIEmbed(ctx context.Context, kind string, texts []string) ([][]float32, error) {
-	prefix := prefixForKind(kind)
+	prefix := ""
+	if c.shouldPrefix() {
+		prefix = prefixForKind(kind)
+	}
 	inputs := make([]string, len(texts))
 	for i, t := range texts {
 		inputs[i] = prefix + t

@@ -60,7 +60,7 @@ POST /v1/observations
   2 extractEntityCandidates   tokens over [A-Za-z0-9.:-], host:port stripped,
                               hyphens preserved inside tokens, ≤32 candidates
   3 resolver.ResolveBatch     normalize → lookup-or-create mem.entities
-  4 embed(content)            TEI nomic-ai/nomic-embed-text-v1.5, kind=document;
+  4 embed(content)            TEI BAAI/bge-base-en-v1.5, kind=document;
                               failure ⇒ empty vector + embedded=false (write succeeds)
   5 INSERT mem.observations   append-only
   6 audit row                 counts-only summary (never content); best-effort
