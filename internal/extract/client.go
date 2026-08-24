@@ -118,11 +118,13 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 		return nil, fmt.Errorf("extract: BaseURL/Model not configured")
 	}
 
+	userContent := "Extract facts from this investigation note. Return ONLY a JSON array per the system instructions — no prose, no explanation:\n\n" + content + "\n\nJSON array:"
+
 	reqBody, err := json.Marshal(chatRequest{
 		Model: c.cfg.Model,
 		Messages: []chatMessage{
 			{Role: "system", Content: SystemPrompt},
-			{Role: "user", Content: content},
+			{Role: "user", Content: userContent},
 		},
 		Temperature: 0,
 		MaxTokens:   maxTokens,
@@ -173,7 +175,10 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 
 	raws, err := parseArray(modelOut)
 	if err != nil {
-		return nil, err
+		if strings.Contains(err.Error(), "no JSON array") {
+			return []Proposal{}, nil
+		}
+		return nil, fmt.Errorf("%w (model output snippet: %.300q)", err, truncate(modelOut, 300))
 	}
 	return Sanitize(raws), nil
 }
