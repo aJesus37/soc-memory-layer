@@ -77,8 +77,8 @@ func TestProposeHappyPath(t *testing.T) {
 		t.Errorf("system message wrong; role=%q content-prefix=%q",
 			req.Messages[0].Role, truncate(req.Messages[0].Content, 40))
 	}
-	if req.Messages[1].Role != "user" || req.Messages[1].Content != "some note" {
-		t.Errorf("user message must carry note verbatim: %+v", req.Messages[1])
+	if req.Messages[1].Role != "user" || !strings.Contains(req.Messages[1].Content, "some note") {
+		t.Errorf("user message must carry note: %+v", req.Messages[1])
 	}
 	if req.Temperature != 0 {
 		t.Errorf("temperature = %v, want 0", req.Temperature)
@@ -149,12 +149,12 @@ func TestProposeNoArrayAtAll(t *testing.T) {
 	srv, _ := chatServer(t, "I cannot help with that.")
 	c := chatClient(srv.URL)
 
-	_, err := c.Propose(context.Background(), "note")
-	if err == nil {
-		t.Fatal("want error when output has no array, got nil")
+	props, err := c.Propose(context.Background(), "note")
+	if err != nil {
+		t.Fatalf("want empty slice for prose with no JSON, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no JSON array") {
-		t.Errorf("unexpected error: %v", err)
+	if len(props) != 0 {
+		t.Fatalf("want 0 proposals for prose with no JSON, got %+v", props)
 	}
 }
 
@@ -275,12 +275,12 @@ func TestProposeMissingContent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := chatClient(srv.URL).Propose(context.Background(), "note")
-	if err == nil {
-		t.Fatal("want error for empty model output, got nil")
+	props, err := chatClient(srv.URL).Propose(context.Background(), "note")
+	if err != nil {
+		t.Fatalf("want empty slice for missing content, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no JSON array") {
-		t.Errorf("unexpected error: %v", err)
+	if len(props) != 0 {
+		t.Fatalf("want 0 proposals for missing content, got %+v", props)
 	}
 }
 

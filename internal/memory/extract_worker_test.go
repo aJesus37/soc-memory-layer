@@ -40,6 +40,10 @@ type scriptedFakeChat struct {
 }
 
 func (f *scriptedFakeChat) Propose(_ context.Context, content string) ([]extract.Proposal, error) {
+	return f.ProposeWithPredicates(context.Background(), content, nil)
+}
+
+func (f *scriptedFakeChat) ProposeWithPredicates(_ context.Context, content string, _ []string) ([]extract.Proposal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -75,6 +79,9 @@ type panickingChat struct{ calls atomic.Int64 }
 func (p *panickingChat) Propose(context.Context, string) ([]extract.Proposal, error) {
 	p.calls.Add(1)
 	panic("chat exploded")
+}
+func (p *panickingChat) ProposeWithPredicates(ctx context.Context, content string, _ []string) ([]extract.Proposal, error) {
+	return p.Propose(ctx, content)
 }
 
 // drainExtractionBacklog marks every pre-existing observation covered so
@@ -424,6 +431,9 @@ func (c *shutdownRacingChat) Propose(context.Context, string) ([]extract.Proposa
 	c.cancel() // the shutdown signal lands mid-flight
 	return nil, fmt.Errorf("extract: POST http://model/v1/chat/completions: %w", context.Canceled)
 }
+func (c *shutdownRacingChat) ProposeWithPredicates(ctx context.Context, content string, _ []string) ([]extract.Proposal, error) {
+	return c.Propose(ctx, content)
+}
 
 // Regression: a cancellation mid-Propose must NOT permanently cover the
 // observation — the coverage write is skipped so a shutdown race retries the
@@ -473,6 +483,9 @@ type timeoutChat struct{ calls atomic.Int64 }
 func (c *timeoutChat) Propose(context.Context, string) ([]extract.Proposal, error) {
 	c.calls.Add(1)
 	return nil, fmt.Errorf("extract: POST http://model/v1/chat/completions: %w", context.DeadlineExceeded)
+}
+func (c *timeoutChat) ProposeWithPredicates(ctx context.Context, content string, _ []string) ([]extract.Proposal, error) {
+	return c.Propose(ctx, content)
 }
 
 // Regression: a client-side timeout with a live run context is an LLM

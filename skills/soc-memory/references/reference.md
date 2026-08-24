@@ -26,7 +26,7 @@
 
 `verdict_malicious`, `resolved_to`, `beaconed_to`, `communicates_with`, `attributed_to`, `hosted_on`, `used_by`, `targeted`, `is_honeypot`
 
-Any short snake_case string is valid; keep them consistent (`resolved_to` not `resolves_to`).
+Any short snake_case string is valid; keep them consistent (`resolved_to` not `resolves_to`). Keep predicates free of judgment — use `download_file`/`download_binary` not `download_malware`; express the verdict as a separate `verdict_malicious` fact on the same subject.
 
 ## Trust Model
 

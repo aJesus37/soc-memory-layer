@@ -196,6 +196,7 @@ func New(d Deps) *server.MCPServer {
 	s.AddTool(memoryTraverseTool(), traverseHandler(d))
 	s.AddTool(memoryRecordObservationTool(), recordObservationHandler(d))
 	s.AddTool(memoryAssertFactTool(), assertFactHandler(d))
+	s.AddTool(memoryListPredicatesTool(), listPredicatesHandler(d))
 	return s
 }
 
@@ -291,17 +292,27 @@ func memoryAssertFactTool() mcp.Tool {
 				"predicate=\"resolved_to\", object_value=\"203.0.113.9\" (this WRITES). Facts asserted "+
 				"by HUMAN actors become ACTIVE immediately; AGENT actors create PROPOSED candidates "+
 				"pending human review (policy may auto-activate high-confidence whitelisted predicates). "+
-				"If object_key names another known entity, the fact also links both in the graph."),
+				"If object_key names another known entity, the fact also links both in the graph. "+
+				"Tip: call memory_list_predicates first to reuse an existing predicate when one fits, "+
+				"instead of inventing a near-duplicate like tries_to_download vs download_file — and keep predicates free of judgment (use download_file, not download_malware; verdict is a separate fact)."),
 		mcp.WithString("subject_key", mcp.Required(),
 			mcp.Description("Raw indicator text identifying the fact's subject; created on first sight if unknown.")),
 		mcp.WithString("predicate", mcp.Required(),
-			mcp.Description("Short snake_case relation name, e.g. resolved_to, beaconed_to, verdict_malicious.")),
+			mcp.Description("Short snake_case relation name, e.g. resolved_to, beaconed_to, verdict_malicious. Prefer an existing predicate from memory_list_predicates when one fits.")),
 		mcp.WithString("object_value", mcp.Required(),
 			mcp.Description("The fact's value as free text, e.g. an IP, a verdict label, a port.")),
 		mcp.WithNumber("confidence",
 			mcp.Description("Your confidence in 0..1 (default 0.5). Only relevant for agent actors' auto-activation policy.")),
 		mcp.WithString("object_key",
 			mcp.Description("Optional raw indicator naming another ENTITY this fact points at; links the two in the graph.")),
+	)
+}
+
+func memoryListPredicatesTool() mcp.Tool {
+	return mcp.NewTool("memory_list_predicates",
+		mcp.WithDescription(
+			"List distinct predicates with usage counts, most-used first. Call before inventing a new predicate "+
+				"so you can reuse an existing one when it fits (e.g. prefer download_file over tries_to_download_file; keep predicates free of judgment — verdict is a separate fact)."),
 	)
 }
 
@@ -489,6 +500,17 @@ func assertFactHandler(d Deps) server.ToolHandlerFunc {
 			ObjectID: f.ObjectID, Status: string(f.Status),
 			Confidence: f.Confidence, ValidFrom: f.ValidFrom, WrittenBy: f.WrittenBy,
 		}), nil
+	}
+}
+
+func listPredicatesHandler(d Deps) server.ToolHandlerFunc {
+	return func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		stats, err := d.Svc.ListPredicates(ctx)
+		if err != nil {
+			return toolErrorFrom(err), nil
+		}
+		b, _ := json.Marshal(stats)
+		return mcp.NewToolResultText(string(b)), nil
 	}
 }
 

@@ -44,6 +44,9 @@ type ChatClient interface {
 	// model output; malformed responses come back as errors or as
 	// silently dropped items.
 	Propose(ctx context.Context, content string) ([]Proposal, error)
+	// ProposeWithPredicates is like Propose but includes a known vocabulary
+	// hint so the model reuses existing predicates when appropriate.
+	ProposeWithPredicates(ctx context.Context, content string, knownPredicates []string) ([]Proposal, error)
 }
 
 // Config configures the OpenAI-compatible chat client.
@@ -115,16 +118,24 @@ var predicateRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,40}$`)
 
 // Propose implements ChatClient.
 func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) {
+	return c.ProposeWithPredicates(ctx, content, nil)
+}
+
+func (c *Chat) ProposeWithPredicates(ctx context.Context, content string, knownPredicates []string) ([]Proposal, error) {
 	if c.cfg.BaseURL == "" || c.cfg.Model == "" {
 		return nil, fmt.Errorf("extract: BaseURL/Model not configured")
 	}
 
+	systemPrompt := SystemPrompt
+	if len(knownPredicates) > 0 {
+		systemPrompt = SystemPromptWithPredicates(knownPredicates)
+	}
 	userContent := "Extract facts from this investigation note. Return ONLY a JSON array per the system instructions — no prose, no explanation:\n\n" + content + "\n\nJSON array:"
 
 	reqBody, err := json.Marshal(chatRequest{
 		Model: c.cfg.Model,
 		Messages: []chatMessage{
-			{Role: "system", Content: SystemPrompt},
+			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userContent},
 		},
 		Temperature: 0,

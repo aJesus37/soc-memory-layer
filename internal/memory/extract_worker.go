@@ -122,13 +122,23 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 		return 0, err
 	}
 
+	// Known predicates hint — best effort; extraction still works without it.
+	var knownPredicates []string
+	if stats, err := s.ListPredicates(ctx); err == nil {
+		for _, p := range stats {
+			knownPredicates = append(knownPredicates, p.Predicate)
+		}
+	} else {
+		s.log.Warn("memory: list predicates for extraction vocabulary failed", "err", err)
+	}
+
 	asserted := 0
 	for _, o := range pending {
 		if err := ctx.Err(); err != nil {
 			return asserted, err
 		}
 
-		proposals, perr := chat.Propose(ctx, o.content)
+		proposals, perr := chat.ProposeWithPredicates(ctx, o.content, knownPredicates)
 		switch {
 		case perr == nil:
 			if len(proposals) == 0 {

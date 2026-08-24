@@ -827,6 +827,38 @@ func (s *Service) insertFact(ctx context.Context, f factArgs, status Status, con
 // insertFact wraps it with the open-ended sentinel for ordinary writes.
 // updated_at rides along with valid_from (now), matching the column's
 // DEFAULT now64(3).
+type PredicateStat struct {
+	Predicate string `json:"predicate"`
+	Count     int    `json:"count"`
+}
+
+// ListPredicates returns distinct predicates with usage counts across all
+// scopes, most-used first. Useful for agents to discover the canonical
+// vocabulary before inventing a new predicate.
+func (s *Service) ListPredicates(ctx context.Context) ([]PredicateStat, error) {
+	rows, err := s.conn.Query(ctx,
+		"SELECT predicate, count() AS c FROM mem.facts GROUP BY predicate ORDER BY c DESC")
+	if err != nil {
+		return nil, fmt.Errorf("memory: list predicates: %w", err)
+	}
+	defer rows.Close()
+	var out []PredicateStat
+	for rows.Next() {
+		var r PredicateStat
+		if err := rows.Scan(&r.Predicate, &r.Count); err != nil {
+			return nil, fmt.Errorf("memory: scan predicate: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("memory: iterate predicates: %w", err)
+	}
+	if out == nil {
+		out = []PredicateStat{}
+	}
+	return out, nil
+}
+
 func (s *Service) insertFactRow(ctx context.Context, f factArgs, status Status, conf float32, validFrom, validTo time.Time) error {
 	b, err := s.conn.PrepareBatch(ctx,
 		"INSERT INTO mem.facts "+

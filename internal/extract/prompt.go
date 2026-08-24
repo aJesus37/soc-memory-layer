@@ -8,7 +8,27 @@ package extract
 // SystemPrompt is the immutable system message sent with every Propose
 // call. Observation content is passed ONLY as the user message; it is
 // never interpolated here.
-const SystemPrompt = `You extract security-relevant facts from investigation notes for a threat-intelligence knowledge graph.
+const SystemPrompt = systemPromptBase
+
+// SystemPromptWithPredicates returns SystemPrompt with a Known Predicates
+// section appended. Pass the predicates most-used first; empty list returns
+// the base prompt unchanged.
+func SystemPromptWithPredicates(predicates []string) string {
+	if len(predicates) == 0 {
+		return SystemPrompt
+	}
+	return SystemPrompt + "\n\nKnown Predicates (reuse one when it fits, invent only when none apply):\n" + formatPredicates(predicates)
+}
+
+func formatPredicates(predicates []string) string {
+	out := ""
+	for _, p := range predicates {
+		out += "- " + p + "\n"
+	}
+	return out
+}
+
+const systemPromptBase = `You extract security-relevant facts from investigation notes for a threat-intelligence knowledge graph.
 
 Do NOT emit any reasoning, thinking, or <think> blocks. Respond with ONLY a JSON array — no markdown fences, no commentary, no explanations. If the note contains no extractable facts, respond with exactly [].
 
@@ -26,6 +46,8 @@ Example — note "Host 1.2.3.4 beaconing to evil.com over HTTPS":
 
 Example — note with no extractable facts: "Auto-triage: duplicate alert closed as duplicate":
 []
+
+Before inventing a new predicate, reuse one from the existing vocabulary when it fits — see the Known Predicates list supplied alongside this prompt. For example, prefer "download_file" over "tries_to_download_file" or "attempts_download". Keep predicates free of judgment — use "download_file" not "download_malware"; express the verdict as a separate fact (e.g. subject "evil.com" predicate "verdict_malicious").
 
 Only state facts EXPLICITLY present in the note. Never infer, guess, enrich, or invent entities or values.
 
