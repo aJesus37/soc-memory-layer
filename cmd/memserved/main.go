@@ -68,6 +68,7 @@ func main() {
 	embedder := embed.NewOpenAI(embed.Config{
 		BaseURL: cfg.EmbedURL,
 		Model:   cfg.EmbedModel,
+		APIKey:  cfg.EmbedAPIKey,
 		HTTP:    &http.Client{Timeout: 120 * time.Second},
 	})
 
@@ -103,15 +104,14 @@ func main() {
 		logger.Info("projection worker idle: dgraph not attached")
 	}
 	if cfg.ExtractEnabled {
-		// Same LM Studio endpoint serves embeddings and chat completions in
-		// the dev topology, so EmbedURL doubles as the chat base URL (the
-		// env name is historical; no separate chat URL exists to configure).
-		// Same generous client timeout as the embedder: local models are
-		// slow to first token and lazily loaded, and the default 60s client
-		// timeout would classify routine slowness as a per-request failure.
+		// ExtractBaseURL defaults to EmbedURL so a single LM Studio endpoint
+		// serves both roles in dev. In production, point them at different
+		// providers/models (e.g. EmbedURL -> OpenAI embeddings model,
+		// ExtractBaseURL -> hosted chat model) and supply API keys.
 		chat := extract.NewChat(extract.Config{
-			BaseURL: cfg.EmbedURL,
+			BaseURL: cfg.ExtractBaseURL,
 			Model:   cfg.ExtractModel,
+			APIKey:  cfg.ExtractAPIKey,
 			HTTP:    &http.Client{Timeout: 120 * time.Second},
 		})
 		go runExtractionWorker(ctx, logger, svc, chat, cfg.ExtractModel,

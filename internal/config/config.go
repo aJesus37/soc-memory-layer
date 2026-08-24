@@ -14,11 +14,14 @@ type Config struct {
 	ListenAddr   string
 	EmbedURL     string
 	EmbedModel   string
+	EmbedAPIKey  string // MEM_EMBED_API_KEY
 	AgentRateRPS float64
 
 	// Phase-2 background workers.
 	ExtractEnabled         bool   // MEM_EXTRACT_ENABLED, default false
 	ExtractModel           string // MEM_EXTRACT_MODEL
+	ExtractBaseURL         string // MEM_EXTRACT_BASE_URL; empty → EmbedURL
+	ExtractAPIKey          string // MEM_EXTRACT_API_KEY
 	ExtractIntervalSeconds int    // MEM_EXTRACT_INTERVAL_SECONDS
 	ProjectIntervalSeconds int    // MEM_PROJECT_INTERVAL_SECONDS
 }
@@ -53,18 +56,26 @@ func envInt(key string, def int) int {
 }
 
 func Load() Config {
+	embedURL := envOr("MEM_EMBED_URL", "http://localhost:1234/v1")
+	extractBaseURL := os.Getenv("MEM_EXTRACT_BASE_URL")
+	if strings.TrimSpace(extractBaseURL) == "" {
+		extractBaseURL = embedURL
+	}
 	return Config{
 		ChAddr:       envOr("MEM_CH_ADDR", "localhost:9000"),
 		DgraphAddr:   envOr("MEM_DGRAPH_ADDR", "localhost:9080"),
 		ChUser:       envOr("MEM_CH_USER", "mem"),
 		ChPassword:   envOr("MEM_CH_PASSWORD", "memdev"),
 		ListenAddr:   envOr("MEM_LISTEN_ADDR", ":8080"),
-		EmbedURL:     envOr("MEM_EMBED_URL", "http://localhost:1234/v1"),
+		EmbedURL:     embedURL,
 		EmbedModel:   envOr("MEM_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5"),
+		EmbedAPIKey:  os.Getenv("MEM_EMBED_API_KEY"),
 		AgentRateRPS: 5,
 
 		ExtractEnabled:         envBool("MEM_EXTRACT_ENABLED"),
 		ExtractModel:           envOr("MEM_EXTRACT_MODEL", "qwen/qwen3-8b"),
+		ExtractBaseURL:         extractBaseURL,
+		ExtractAPIKey:          os.Getenv("MEM_EXTRACT_API_KEY"),
 		ExtractIntervalSeconds: envInt("MEM_EXTRACT_INTERVAL_SECONDS", 30),
 		ProjectIntervalSeconds: envInt("MEM_PROJECT_INTERVAL_SECONDS", 5),
 	}

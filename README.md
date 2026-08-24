@@ -98,9 +98,16 @@ leaks to clients). Unknown JSON fields are rejected — typos fail loudly.
 
 `MEM_CH_ADDR` (:9000) · `MEM_CH_USER` (mem) · `MEM_CH_PASSWORD` (memdev) ·
 `MEM_LISTEN_ADDR` (:8080) · `MEM_EMBED_URL` (http://localhost:1234/v1) ·
-`MEM_EMBED_MODEL` (nomic-embed-text-v1.5) · `MEM_TRUST_FLOOR` (0.8) ·
-`MEM_TRUST_WHITELIST` (resolved_to) · client timeout for embeddings is 120s
-(model cold-start).
+`MEM_EMBED_MODEL` (nomic-embed-text-v1.5) · `MEM_EMBED_API_KEY` (none) ·
+`MEM_TRUST_FLOOR` (0.8) · `MEM_TRUST_WHITELIST` (resolved_to) · client timeout
+for embeddings is 120s (model cold-start).
+
+For extraction: `MEM_EXTRACT_ENABLED` (off) · `MEM_EXTRACT_MODEL`
+(qwen/qwen3-8b) · `MEM_EXTRACT_BASE_URL` (empty → `MEM_EMBED_URL`) ·
+`MEM_EXTRACT_API_KEY` (none). Any OpenAI-compatible provider works — set
+the base URL to `https://api.openai.com/v1` (plus an API key) or any other
+`/v1` endpoint (Anthropic, Azure, Groq, Ollama, vLLM, …) and set the model
+name accordingly.
 
 ## Operations notes
 

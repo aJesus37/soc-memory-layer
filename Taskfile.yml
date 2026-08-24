@@ -24,9 +24,9 @@ tasks:
       MEM_TEST_DGRAPH_ADDR: localhost:9080
 
   db-up:
-    desc: Start the dev stack (ClickHouse + Dgraph), waits for health
+    desc: Start the dev stack (ClickHouse + Dgraph + embedder), waits for health
     cmds:
-      - docker compose up -d --wait clickhouse dgraph
+      - docker compose up -d --wait clickhouse dgraph embedder
 
   db-down:
     desc: Stop the stack and wipe volumes

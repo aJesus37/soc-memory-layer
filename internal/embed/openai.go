@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,11 +28,13 @@ const defaultTimeout = 30 * time.Second
 type Config struct {
 	BaseURL string       // e.g. http://localhost:1234/v1
 	Model   string       // e.g. nomic-embed-text-v1.5
+	APIKey  string       // bearer token; sent only when non-empty
 	HTTP    *http.Client // optional override; default 30s timeout
 }
 
 // OpenAI is an Embedder backed by any OpenAI-compatible /embeddings
-// endpoint (LM Studio, OpenAI, ...).
+// endpoint (LM Studio, OpenAI, ...). On 404 it falls back to the TEI-native
+// /embed shape so the same client serves both.
 type OpenAI struct {
 	cfg    Config
 	client *http.Client
@@ -71,59 +74,67 @@ type openAIResponse struct {
 }
 
 // Embed implements Embedder. Empty input returns nil without an API call.
+// It first tries the OpenAI shape (/embeddings); on 404 it falls back to
+// the TEI-native shape (/embed) so the same binary serves LM Studio,
+// OpenAI, and HuggingFace TEI without configuration changes.
 func (c *OpenAI) Embed(ctx context.Context, kind string, texts []string) ([][]float32, error) {
 	if c.cfg.BaseURL == "" || c.cfg.Model == "" {
 		return nil, fmt.Errorf("embed: BaseURL/Model not configured")
 	}
-
 	switch kind {
-	case "document":
-		kind = prefixDocument
-	case "query":
-		kind = prefixQuery
+	case "document", "query":
 	default:
 		return nil, fmt.Errorf("embed: unknown kind %q (want \"document\" or \"query\")", kind)
 	}
-
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	out, err := c.doOpenAIEmbed(ctx, kind, texts)
+	if err == nil {
+		return out, nil
+	}
+	if !isNotFound(err) {
+		return nil, err
+	}
+	return c.doTEIEmbed(ctx, kind, texts)
+}
 
+func isNotFound(err error) bool {
+	var se *StatusError
+	return err != nil && errors.As(err, &se) && se.Status == http.StatusNotFound
+}
+
+func (c *OpenAI) doOpenAIEmbed(ctx context.Context, kind string, texts []string) ([][]float32, error) {
+	prefix := prefixForKind(kind)
 	input := make([]string, len(texts))
 	for i, t := range texts {
-		input[i] = kind + t
+		input[i] = prefix + t
 	}
-
 	reqBody, err := json.Marshal(openAIRequest{Model: c.cfg.Model, Input: input})
 	if err != nil {
 		return nil, fmt.Errorf("embed: marshal request: %w", err)
 	}
-
 	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/embeddings"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("embed: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-
+	if c.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embed: POST %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("embed: read response: %w", err)
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, &StatusError{
-			Status: resp.StatusCode,
-			Body:   truncate(string(body), 512),
-		}
+		return nil, &StatusError{Status: resp.StatusCode, Body: truncate(string(body), 512)}
 	}
-
 	var parsed openAIResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("embed: decode response: %w", err)
@@ -131,7 +142,6 @@ func (c *OpenAI) Embed(ctx context.Context, kind string, texts []string) ([][]fl
 	if len(parsed.Data) != len(texts) {
 		return nil, fmt.Errorf("embed: got %d embeddings, want %d", len(parsed.Data), len(texts))
 	}
-
 	out := make([][]float32, len(texts))
 	for _, d := range parsed.Data {
 		if d.Index < 0 || d.Index >= len(out) {
@@ -145,6 +155,61 @@ func (c *OpenAI) Embed(ctx context.Context, kind string, texts []string) ([][]fl
 		}
 	}
 	return out, nil
+}
+
+func prefixForKind(kind string) string {
+	switch kind {
+	case "document":
+		return prefixDocument
+	case "query":
+		return prefixQuery
+	default:
+		return ""
+	}
+}
+
+func (c *OpenAI) doTEIEmbed(ctx context.Context, kind string, texts []string) ([][]float32, error) {
+	prefix := prefixForKind(kind)
+	inputs := make([]string, len(texts))
+	for i, t := range texts {
+		inputs[i] = prefix + t
+	}
+	type teiReq struct {
+		Inputs []string `json:"inputs"`
+	}
+	reqBody, err := json.Marshal(teiReq{Inputs: inputs})
+	if err != nil {
+		return nil, fmt.Errorf("embed: marshal TEI request: %w", err)
+	}
+	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/embed"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("embed: build TEI request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("embed: POST %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("embed: read TEI response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &StatusError{Status: resp.StatusCode, Body: truncate(string(body), 512)}
+	}
+	var parsed [][]float32
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("embed: decode TEI response: %w", err)
+	}
+	if len(parsed) != len(texts) {
+		return nil, fmt.Errorf("embed: TEI got %d embeddings, want %d", len(parsed), len(texts))
+	}
+	return parsed, nil
 }
 
 func truncate(s string, max int) string {

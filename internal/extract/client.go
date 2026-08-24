@@ -49,6 +49,7 @@ type ChatClient interface {
 type Config struct {
 	BaseURL string       // e.g. http://localhost:1234/v1
 	Model   string       // e.g. qwen3-8b
+	APIKey  string       // bearer token; sent only when non-empty
 	HTTP    *http.Client // optional override; default 60s timeout
 }
 
@@ -136,6 +137,9 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 		return nil, fmt.Errorf("extract: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
