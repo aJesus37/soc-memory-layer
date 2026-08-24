@@ -56,7 +56,7 @@ func envInt(key string, def int) int {
 }
 
 func Load() Config {
-	embedURL := envOr("MEM_EMBED_URL", "http://localhost:1234/v1")
+	embedURL := envOr("MEM_EMBED_URL", "http://localhost:3000")
 	extractBaseURL := os.Getenv("MEM_EXTRACT_BASE_URL")
 	if strings.TrimSpace(extractBaseURL) == "" {
 		extractBaseURL = embedURL
@@ -68,7 +68,7 @@ func Load() Config {
 		ChPassword:   envOr("MEM_CH_PASSWORD", "memdev"),
 		ListenAddr:   envOr("MEM_LISTEN_ADDR", ":8080"),
 		EmbedURL:     embedURL,
-		EmbedModel:   envOr("MEM_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5"),
+		EmbedModel:   envOr("MEM_EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5"),
 		EmbedAPIKey:  os.Getenv("MEM_EMBED_API_KEY"),
 		AgentRateRPS: 5,
 
