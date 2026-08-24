@@ -40,6 +40,11 @@ tasks:
     cmds:
       - go run ./cmd/memserved
 
+  stop:
+    desc: Stop any running memserved (frees :8090)
+    cmds:
+      - ps aux | grep '[m]emserved' | awk '{print $2}' | xargs -r kill; sleep 1; echo "stopped (if it was running)"
+
   swagger:
     desc: Regenerate OpenAPI spec from handler annotations
     cmds:
@@ -62,7 +67,7 @@ tasks:
       - go run ./cmd/memseed -file seeds/phantom-portal/observations.jsonl -facts seeds/phantom-portal/facts.jsonl
 
   run-extract:
-    desc: Run the service with dreaming-lite extraction enabled
+    desc: "Run the service with dreaming-lite extraction enabled (stop any existing instance first via task stop)"
     env:
       MEM_EXTRACT_ENABLED: "true"
       MEM_EXTRACT_MODEL: qwen/qwen3-8b

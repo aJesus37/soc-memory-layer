@@ -64,8 +64,13 @@ Walks domain → C2 IP via team-threatresp's edge.
 
 ### 4. Dreaming-lite extraction
 
-Restart the service with `task run-extract`, then POST a *new* note stating a
-fact in prose:
+Restart the service with extraction enabled (`task stop` first if `:8090` is
+already in use), then POST a *new* note stating a fact in prose:
+
+```bash
+task stop          # frees :8090 if a previous instance is still running
+task run-extract   # same service + 30s extraction worker
+```
 
 ```bash
 curl -s -X POST localhost:8090/v1/observations \
