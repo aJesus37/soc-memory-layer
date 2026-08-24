@@ -17,11 +17,11 @@ func TestLoadDefaults(t *testing.T) {
 	if c.DgraphAddr != "localhost:9080" {
 		t.Fatalf("dgraph default wrong: %+v", c)
 	}
-	if c.EmbedURL != "http://localhost:3000" || c.EmbedModel != "nomic-ai/nomic-embed-text-v1.5" {
+	if c.EmbedURL != "http://localhost:3000" || c.EmbedModel != "BAAI/bge-base-en-v1.5" {
 		t.Fatalf("embed defaults wrong: %+v", c)
 	}
-	if c.EmbedURL != c.ExtractBaseURL {
-		t.Fatalf("ExtractBaseURL should default to EmbedURL, got %+v", c)
+	if c.ExtractBaseURL != "http://localhost:1234/v1" {
+		t.Fatalf("ExtractBaseURL default should be LM Studio chat endpoint, got %+v", c)
 	}
 	if c.ExtractEnabled {
 		t.Errorf("extraction enabled by default: %+v", c)
