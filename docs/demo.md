@@ -53,7 +53,7 @@ curl -s 'localhost:8090/v1/similar?q=executive target variant&k=10' \
 
 ```bash
 curl -s 'localhost:8090/v1/traverse?type=ioc_domain&key=secure-portal.invoice-update.com&hops=2' \
-  -H ... | python3 -m json.tool
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | python3 -m json.tool
 ```
 
 Walks domain → C2 IP via team-threatresp's edge.
