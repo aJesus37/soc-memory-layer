@@ -40,13 +40,17 @@ observations from tier1 AND threatresp — even though "you" are team-a.
 
 ### 2. Restricted stays home
 
-The Aug-13 restricted note is invisible from any other scope:
+The Aug-13 restricted note is invisible cross-team, but other org results
+still return — you get hits either way, just not the restricted one:
 
 ```bash
+# as team-a (a different team): hits returned, none contain the VP-Finance note
 curl -s 'localhost:8090/v1/similar?q=executive target variant&k=10' \
-  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a'
-# → no restricted content
-# same query with X-Scope: team-tier1 → present
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | jq .
+
+# as team-tier1 (the originating scope): the restricted observation appears
+curl -s 'localhost:8090/v1/similar?q=executive target variant&k=10' \
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-tier1' | jq .
 ```
 
 ### 3. Graph traversal across teams
