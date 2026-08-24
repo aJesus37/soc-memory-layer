@@ -20,8 +20,8 @@ func TestLoadDefaults(t *testing.T) {
 	if c.EmbedURL != "http://localhost:3000" || c.EmbedModel != "BAAI/bge-base-en-v1.5" {
 		t.Fatalf("embed defaults wrong: %+v", c)
 	}
-	if c.ExtractBaseURL != "http://localhost:11434/v1" {
-		t.Fatalf("ExtractBaseURL default should be Ollama chat endpoint, got %+v", c)
+	if c.ExtractBaseURL != "" {
+		t.Fatalf("ExtractBaseURL should be empty by default (external provider required when extraction enabled), got %+v", c)
 	}
 	if c.ExtractEnabled {
 		t.Errorf("extraction enabled by default: %+v", c)

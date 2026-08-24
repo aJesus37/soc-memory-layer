@@ -57,7 +57,7 @@ func envInt(key string, def int) int {
 
 func Load() Config {
 	embedURL := envOr("MEM_EMBED_URL", "http://localhost:3000")
-	extractBaseURL := envOr("MEM_EXTRACT_BASE_URL", "http://localhost:11434/v1")
+	extractBaseURL := strings.TrimSpace(os.Getenv("MEM_EXTRACT_BASE_URL"))
 	return Config{
 		ChAddr:       envOr("MEM_CH_ADDR", "localhost:9000"),
 		DgraphAddr:   envOr("MEM_DGRAPH_ADDR", "localhost:9080"),

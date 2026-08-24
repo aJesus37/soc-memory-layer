@@ -102,7 +102,7 @@ leaks to clients). Unknown JSON fields are rejected — typos fail loudly.
 for embeddings is 120s (model cold-start).
 
 For extraction: `MEM_EXTRACT_ENABLED` (off) · `MEM_EXTRACT_MODEL`
-(qwen/qwen3-8b) · `MEM_EXTRACT_BASE_URL` (empty → `MEM_EMBED_URL`) ·
+(qwen/qwen3-8b) · `MEM_EXTRACT_BASE_URL` (empty → extraction disabled) ·
 `MEM_EXTRACT_API_KEY` (none). Any OpenAI-compatible provider works — set
 the base URL to `https://api.openai.com/v1` (plus an API key) or any other
 `/v1` endpoint (Anthropic, Azure, Groq, Ollama, vLLM, …) and set the model
