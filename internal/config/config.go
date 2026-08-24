@@ -16,6 +16,7 @@ type Config struct {
 	EmbedModel   string
 	EmbedAPIKey  string // MEM_EMBED_API_KEY
 	AgentRateRPS float64
+	LogLevel     string // MEM_LOG_LEVEL, default info
 
 	// Phase-2 background workers.
 	ExtractEnabled         bool   // MEM_EXTRACT_ENABLED, default false
@@ -68,6 +69,7 @@ func Load() Config {
 		EmbedModel:   envOr("MEM_EMBED_MODEL", "BAAI/bge-base-en-v1.5"),
 		EmbedAPIKey:  os.Getenv("MEM_EMBED_API_KEY"),
 		AgentRateRPS: 5,
+		LogLevel:     envOr("MEM_LOG_LEVEL", "info"),
 
 		ExtractEnabled:         envBool("MEM_EXTRACT_ENABLED"),
 		ExtractModel:           envOr("MEM_EXTRACT_MODEL", "qwen/qwen3-8b"),

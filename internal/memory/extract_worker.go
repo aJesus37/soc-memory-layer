@@ -131,6 +131,11 @@ func (s *Service) RunExtractionOnce(ctx context.Context, chat extract.ChatClient
 		proposals, perr := chat.Propose(ctx, o.content)
 		switch {
 		case perr == nil:
+			if len(proposals) == 0 {
+				s.log.Debug("memory: extraction yielded no proposals for observation",
+					"obs_id", o.id,
+					"content_snippet", truncateStr(o.content, 200))
+			}
 			n, aerr := s.applyProposals(ctx, o, proposals)
 			asserted += n
 			if aerr != nil {
@@ -316,6 +321,13 @@ func (s *Service) RunExtractionLoop(ctx context.Context, chat extract.ChatClient
 			s.extractionTick(ctx, chat, batch)
 		}
 	}
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // extractionTick guards one loop iteration. The recover wraps the whole

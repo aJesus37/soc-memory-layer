@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"regexp"
@@ -176,11 +177,20 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 	raws, err := parseArray(modelOut)
 	if err != nil {
 		if strings.Contains(err.Error(), "no JSON array") {
+			slog.Debug("extract: model returned no JSON array — treating as 0 proposals",
+				"snippet", truncate(modelOut, 500))
 			return []Proposal{}, nil
 		}
 		return nil, fmt.Errorf("%w (model output snippet: %.300q)", err, truncate(modelOut, 300))
 	}
-	return Sanitize(raws), nil
+	sanitized := Sanitize(raws)
+	if len(sanitized) == 0 && len(raws) > 0 {
+		slog.Debug("extract: all proposals sanitized away",
+			"raw_count", len(raws), "snippet", truncate(modelOut, 500))
+	} else if len(sanitized) == 0 {
+		slog.Debug("extract: model returned empty array — no facts in note")
+	}
+	return sanitized, nil
 }
 
 // parseArray pulls a JSON array out of arbitrary model text: strips

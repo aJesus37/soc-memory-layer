@@ -38,11 +38,26 @@ const extractionBatch = 32
 // @in							header
 // @name						X-Actor-Type
 // @description				Plus X-Actor-ID and X-Scope headers; identity never travels in bodies.
-func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
+func parseLogLevel(s string) slog.Level {
+	switch s {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
 
+func main() {
 	cfg := config.Load()
+
+	var level slog.LevelVar
+	level.Set(parseLogLevel(cfg.LogLevel))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level}))
+	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
