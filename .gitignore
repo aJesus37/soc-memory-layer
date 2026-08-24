@@ -3,3 +3,4 @@
 /memeval
 *.test
 .env
+dist/

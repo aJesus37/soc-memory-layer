@@ -80,3 +80,53 @@ tasks:
     desc: Build memmcp for local stdio use
     cmds:
       - go build -o memmcp ./cmd/memmcp
+
+  install-skills:
+    desc: Install repo skills for development (symlink by default; --copy to copy instead)
+    cmds:
+      - |
+        MODE="symlink"
+        for arg in {{.CLI_ARGS}}; do [ "$arg" = "--copy" ] && MODE="copy" && break; done
+        DEST_BASE=""
+        if [ -d "$HOME/.agents/skills" ]; then DEST_BASE="$HOME/.agents/skills"
+        elif [ -d "$HOME/.config/opencode/skills" ]; then DEST_BASE="$HOME/.config/opencode/skills"
+        else DEST_BASE="$HOME/.agents/skills"; mkdir -p "$DEST_BASE"; fi
+        for src in skills/*; do
+          [ -d "$src" ] || continue
+          name=$(basename "$src")
+          dest="$DEST_BASE/$name"
+          rm -rf "$dest"
+          if [ "$MODE" = "copy" ]; then cp -r "$src" "$dest"; echo "installed (copy) $name -> $dest"
+          else ln -s "$(pwd)/$src" "$dest"; echo "installed (symlink) $name -> $dest"; fi
+        done
+
+  uninstall-skills:
+    desc: Remove repo skills from the global skills dir
+    cmds:
+      - |
+        for dest_base in "$HOME/.agents/skills" "$HOME/.config/opencode/skills"; do
+          for src in skills/*; do
+            [ -d "$src" ] || continue
+            name=$(basename "$src")
+            dest="$dest_base/$name"
+            # only remove if it points at this repo (symlink) or was copied from it
+            if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$(pwd)/$src" ]; then rm "$dest" && echo "removed $dest (symlink)"; fi
+            # for copied installs, check a marker file to avoid deleting unrelated skills
+            if [ ! -L "$dest" ] && [ -f "$dest/SKILL.md" ] && grep -q "soc-memory" "$dest/SKILL.md" 2>/dev/null; then
+              # extra guard: only if this skill came from this repo's soc-memory
+              case "$name" in soc-memory) rm -rf "$dest" && echo "removed $dest (copy)" ;; esac
+            fi
+          done
+        done
+        echo "done"
+
+  package-skills:
+    desc: Package repo skills into .skill files (uses skill-creator's packager)
+    cmds:
+      - |
+        OUT="${1:-dist}"; [ -n "{{.CLI_ARGS}}" ] && OUT="{{.CLI_ARGS}}"
+        mkdir -p "$OUT"
+        for src in skills/*; do
+          [ -d "$src" ] || continue
+          python3 ~/.agents/skills/skill-creator/scripts/package_skill.py "$src" "$OUT" 2>&1 | tail -5
+        done
