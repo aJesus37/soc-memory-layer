@@ -172,6 +172,9 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 	if len(parsed.Choices) == 0 {
 		return nil, fmt.Errorf("extract: response has no choices")
 	}
+	// Log full envelope at DEBUG for empty-content diagnosis (provider may
+	// put reasoning in a separate field or return empty content on filter).
+	slog.Debug("extract: raw API response", "body_snippet", truncate(string(body), 2000))
 	modelOut := parsed.Choices[0].Message.Content
 
 	slog.Debug("extract: raw model output", "snippet", truncate(modelOut, 1200))
