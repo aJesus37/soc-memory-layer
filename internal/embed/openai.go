@@ -117,7 +117,10 @@ func (c *OpenAI) doOpenAIEmbed(ctx context.Context, kind string, texts []string)
 	if err != nil {
 		return nil, fmt.Errorf("embed: marshal request: %w", err)
 	}
-	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/embeddings"
+	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	base = strings.TrimSuffix(base, "/embeddings")
+	base = strings.TrimSuffix(base, "/embed")
+	url := base + "/embeddings"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("embed: build request: %w", err)
@@ -193,7 +196,10 @@ func (c *OpenAI) doTEIEmbed(ctx context.Context, kind string, texts []string) ([
 	if err != nil {
 		return nil, fmt.Errorf("embed: marshal TEI request: %w", err)
 	}
-	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/embed"
+	base2 := strings.TrimRight(c.cfg.BaseURL, "/")
+	base2 = strings.TrimSuffix(base2, "/embeddings")
+	base2 = strings.TrimSuffix(base2, "/embed")
+	url := base2 + "/embed"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("embed: build TEI request: %w", err)

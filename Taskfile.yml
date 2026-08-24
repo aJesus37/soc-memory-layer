@@ -72,7 +72,6 @@ tasks:
     desc: "Run the service with dreaming-lite extraction enabled (stop any existing instance first via task stop)"
     env:
       MEM_EXTRACT_ENABLED: "true"
-      MEM_EXTRACT_MODEL: qwen/qwen3-8b
       MEM_LISTEN_ADDR: localhost:8090
     cmds:
       - go run ./cmd/memserved

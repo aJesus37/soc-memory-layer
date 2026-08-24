@@ -131,7 +131,10 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 		return nil, fmt.Errorf("extract: marshal request: %w", err)
 	}
 
-	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/chat/completions"
+	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	base = strings.TrimSuffix(base, "/chat/completions")
+	base = strings.TrimSuffix(base, "/chat")
+	url := base + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("extract: build request: %w", err)
