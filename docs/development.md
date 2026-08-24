@@ -9,7 +9,7 @@ task db-up              # ClickHouse 26.3 (:9000) + Dgraph standalone (:9080), w
 task itest              # full suite against live stores (auto-starts them)
 ```
 
-LM Studio with `nomic-embed-text-v1.5` on `localhost:1234` is optional — the
+TEI embedder on `localhost:3000` (started by `task db-up`) is optional — the
 service degrades gracefully without it, but similarity's vector leg and the
 extraction worker need it (`lms server start`).
 

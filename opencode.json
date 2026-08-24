@@ -10,8 +10,8 @@
         "MEM_MCP_ACTOR_TYPE": "human",
         "MEM_MCP_ACTOR_ID": "opencode-dev",
         "MEM_MCP_SCOPE": "team-a",
-        "MEM_EMBED_URL": "http://localhost:1234/v1",
-        "MEM_EMBED_MODEL": "text-embedding-nomic-embed-text-v1.5"
+        "MEM_EMBED_URL": "http://localhost:3000",
+        "MEM_EMBED_MODEL": "nomic-ai/nomic-embed-text-v1.5"
       }
     }
   }

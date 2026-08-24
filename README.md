@@ -36,9 +36,8 @@ task db-up                       # ClickHouse 26.3 on :9000 (user mem / memdev)
 task test                        # unit only
 MEM_TEST_CH_ADDR=localhost:9000 go test ./... -count=1   # integration
 
-# 3. Run the service (embedding server optional — degrades gracefully)
-lms server start                 # LM Studio with nomic-embed-text-v1.5 loaded
-task run                         # listens on :8080
+# 3. Run the service (embedder is part of the dev stack via TEI; degrades gracefully if down)
+task run                         # listens on :8090 — embedder already running from db-up
 
 # 4. Write + read
 curl -s localhost:8090/v1/observations \
@@ -97,8 +96,8 @@ leaks to clients). Unknown JSON fields are rejected — typos fail loudly.
 ## Configuration (env)
 
 `MEM_CH_ADDR` (:9000) · `MEM_CH_USER` (mem) · `MEM_CH_PASSWORD` (memdev) ·
-`MEM_LISTEN_ADDR` (:8080) · `MEM_EMBED_URL` (http://localhost:1234/v1) ·
-`MEM_EMBED_MODEL` (nomic-embed-text-v1.5) · `MEM_EMBED_API_KEY` (none) ·
+`MEM_LISTEN_ADDR` (:8080) · `MEM_EMBED_URL` (http://localhost:3000) ·
+`MEM_EMBED_MODEL` (nomic-ai/nomic-embed-text-v1.5) · `MEM_EMBED_API_KEY` (none) ·
 `MEM_TRUST_FLOOR` (0.8) · `MEM_TRUST_WHITELIST` (resolved_to) · client timeout
 for embeddings is 120s (model cold-start).
 
@@ -222,7 +221,7 @@ per-user identity arrives with OIDC (future).
 ```
 cmd/memserved   HTTP server          internal/memory   core domain logic
 cmd/memseed     JSONL backfill       internal/entity   normalization + resolution
-cmd/memeval     recall@k evals       internal/embed    LM Studio/OpenAI client
+cmd/memeval     recall@k evals       internal/embed    TEI/OpenAI-compatible embedding client
 cmd/graphrebuild Dgraph rebuild      internal/extract  LLM fact proposals
 cmd/memmcp      MCP stdio server     internal/graph    Dgraph projection + schema
 internal/ch     connect + migrations internal/api      HTTP transport
