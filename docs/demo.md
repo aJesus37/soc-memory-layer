@@ -45,11 +45,11 @@ still return — you get hits either way, just not the restricted one:
 
 ```bash
 # as team-a (a different team): hits returned, none contain the VP-Finance note
-curl -s 'localhost:8090/v1/similar?q=executive target variant&k=10' \
+curl -s 'localhost:8090/v1/similar?q=executive%20target%20variant&k=10' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | jq .
 
 # as team-tier1 (the originating scope): the restricted observation appears
-curl -s 'localhost:8090/v1/similar?q=executive target variant&k=10' \
+curl -s 'localhost:8090/v1/similar?q=executive%20target%20variant&k=10' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-tier1' | jq .
 ```
 
