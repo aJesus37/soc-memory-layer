@@ -24,7 +24,7 @@ const maxResponseBytes = 10 << 20
 const defaultTimeout = 60 * time.Second
 
 const (
-	maxTokens      = 2048
+	maxTokens      = 8192
 	maxProposals   = 20
 	maxObjectValue = 500
 )
