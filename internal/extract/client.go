@@ -174,6 +174,8 @@ func (c *Chat) Propose(ctx context.Context, content string) ([]Proposal, error) 
 	}
 	modelOut := parsed.Choices[0].Message.Content
 
+	slog.Debug("extract: raw model output", "snippet", truncate(modelOut, 1200))
+
 	raws, err := parseArray(modelOut)
 	if err != nil {
 		if strings.Contains(err.Error(), "no JSON array") {
