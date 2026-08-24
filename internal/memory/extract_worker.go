@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"socmem/internal/entity"
 	"socmem/internal/extract"
 )
 
@@ -239,11 +240,23 @@ func (s *Service) applyProposals(ctx context.Context, o extractObs, proposals []
 				"proposal_index", i)
 			continue
 		}
+		// If the object looks like a known entity (IP/domain/hash/technique),
+		// resolve it so the fact can mint a graph edge. Non-entity values
+		// (e.g. "C2 infrastructure") stay value-only.
+		var objectID string
+		if p.ObjectValue != "" {
+			if _, err := entity.Normalize(p.ObjectValue); err == nil {
+				if objEnt, _, objErr := s.resolver.Resolve(ctx, o.scope, p.ObjectValue); objErr == nil && objEnt.EntityID != "" {
+					objectID = objEnt.EntityID
+				}
+			}
+		}
 		if _, err := s.AssertFact(ctx, FactInput{
 			Scope:       o.scope,
 			SubjectID:   ents[i].EntityID,
 			Predicate:   p.Predicate,
 			ObjectValue: p.ObjectValue,
+			ObjectID:    objectID,
 			Confidence:  p.Confidence, // clamped again inside AssertFact
 			SourceObs:   o.id.String(),
 			ActorType:   actorAgent,
