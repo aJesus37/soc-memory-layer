@@ -134,17 +134,15 @@ func rebuild(ctx context.Context, logger *slog.Logger, cfg config.Config, batch 
 }
 
 // resetWatermarks zeroes both projection cursors so the replay covers the
-// entire pagination order. The watermark names are duplicated here because
-// internal/graph keeps them unexported (see project.go watermarkEntities /
-// watermarkEdges); keep the literals in sync. mutations_sync=1 means a
-// returned error always implies the old cursors still stand.
+// entire pagination order. TRUNCATE is atomic and immediately visible;
+// UPDATE mutations can lag behind concurrent wipes on the shared dev DB.
 func resetWatermarks(ctx context.Context, conn driver.Conn) error {
+	if err := conn.Exec(ctx, "TRUNCATE TABLE mem.projection_watermark"); err != nil {
+		return fmt.Errorf("truncate watermark: %w", err)
+	}
 	if err := conn.Exec(ctx,
-		"ALTER TABLE mem.projection_watermark "+
-			"UPDATE ts = toDateTime64(0, 3), last_id = '' "+
-			"WHERE name IN ('entities', 'edges') "+
-			"SETTINGS mutations_sync = 1"); err != nil {
-		return fmt.Errorf("reset watermarks: %w", err)
+		"INSERT INTO mem.projection_watermark (name, ts, last_id) VALUES ('entities', toDateTime64(0, 3), ''), ('edges', toDateTime64(0, 3), '')"); err != nil {
+		return fmt.Errorf("seed watermarks: %w", err)
 	}
 	return nil
 }

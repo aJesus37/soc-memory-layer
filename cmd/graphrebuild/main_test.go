@@ -63,8 +63,7 @@ func itestBoth(t *testing.T) (*graph.Store, driver.Conn) {
 		t.Fatalf("migrate: %v", err)
 	}
 	for _, table := range []string{"mem.entities", "mem.edges"} {
-		if err := conn.Exec(ctx,
-			"ALTER TABLE "+table+" DELETE WHERE 1 SETTINGS mutations_sync = 1"); err != nil {
+		if err := conn.Exec(ctx, "TRUNCATE TABLE "+table); err != nil {
 			t.Fatalf("wipe %s: %v", table, err)
 		}
 	}
