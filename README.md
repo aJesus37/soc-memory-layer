@@ -26,32 +26,118 @@ extraction, full documentation set.
 | [docs/development.md](docs/development.md) | setup, conventions, how-to-extend |
 | [docs/runbook.md](docs/runbook.md) | ops procedures & troubleshooting |
 
-## Quickstart
+## Prerequisites
+
+- **Go** 1.22+ (`go version`)
+- **Docker** + Compose (`docker compose version`) — for ClickHouse, Dgraph, TEI
+- **[Task](https://taskfile.dev)** (`task --version` or `go install github.com/go-task/task/v3/cmd/task@latest`)
+- `curl` + `jq` (optional, for the demo)
+
+No API keys needed — the dev stack runs fully offline via TEI (`BAAI/bge-base-en-v1.5`) on `:3000`.
+
+## Quickstart (30s)
 
 ```bash
-# 1. Dev database
-task db-up                       # ClickHouse 26.3 on :9000 (user mem / memdev)
+git clone https://github.com/aJesus37/soc-memory-layer && cd soc-memory-layer
 
-# 2. Tests (unit always; integration needs the DB)
-task test                        # unit only
-MEM_TEST_CH_ADDR=localhost:9000 go test ./... -count=1   # integration
+task db-up          # ClickHouse :9000/:8123 + Dgraph :9080 + TEI embedder :3000 (health-gated)
+task run            # memserved on :8090 (leave running; open a second shell for the next steps)
+```
 
-# 3. Run the service (embedder is part of the dev stack via TEI; degrades gracefully if down)
-task run                         # listens on :8090 — embedder already running from db-up
+Write + read:
 
-# 4. Write + read
+```bash
 curl -s localhost:8090/v1/observations \
   -H 'Content-Type: application/json' \
   -H 'X-Actor-Type: human' -H 'X-Actor-ID: analyst-j' -H 'X-Scope: team-a' \
   -d '{"kind":"human_statement","content":"Saw 1.2.3.4 beaconing to evil.example.com"}'
 
 curl -s 'localhost:8090/v1/enrich?type=ioc_ip&key=1.2.3.4' \
-  -H 'X-Actor-Type: agent' -H 'X-Actor-ID: triage-bot' -H 'X-Scope: team-a'
+  -H 'X-Actor-Type: agent' -H 'X-Actor-ID: triage-bot' -H 'X-Scope: team-a' | jq .
 
-# 5. Backfill history / evaluate recall
-go run ./cmd/memseed -file seeds/smoke.jsonl
-go run ./cmd/memeval             # recall@k gate; exits 1 on regression
+open http://localhost:8090/swagger/index.html   # interactive API docs
 ```
+
+Cleanup: `task stop` (stop memserved) / `task db-down` (stop + wipe volumes).
+
+## Demo — PHANTOM PORTAL (2 min, synthetic incident)
+
+A multi-team story (phishing → C2 → loader → attribution) that exercises every feature — cross-team enrichment, `restricted` scoping, graph traversal, extraction, and the trust model. All data is synthetic (RFC 5737 IPs, invented domains). Full walkthrough: [`docs/demo.md`](docs/demo.md).
+
+```bash
+# 1. Start stores + seed the story (3 teams + facts + observations)
+task db-up
+task demo-seed       # seeds/phantom-portal/observations.jsonl + facts.jsonl
+
+# 2. Ensure the service is running
+task run             # :8090 — keep it running in this shell
+```
+
+In a second shell, try the five checks (copy-paste):
+
+```bash
+# 1 — Cross-team enrichment (team-a sees threatresp/hunt knowledge)
+curl -s 'localhost:8090/v1/enrich?type=ioc_domain&key=secure-portal.invoice-update.com' \
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | jq .
+# expect: found:true, facts with origin_scope=team-threatresp
+
+# 2 — Restricted stays home (team-a vs originating scope)
+curl -s 'localhost:8090/v1/similar?q=executive%20target%20variant&k=10' \
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | jq .
+# expect: hits, but NO "VP Finance" restricted note
+curl -s 'localhost:8090/v1/similar?q=executive%20target%20variant&k=10' \
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-tier1' | jq .
+# expect: SAME hits PLUS the restricted VP Finance observation (only team-tier1 sees it)
+
+# 3 — Graph traversal (domain → C2 IP via threatresp edge, hops=2)
+curl -s 'localhost:8090/v1/traverse?type=ioc_domain&key=secure-portal.invoice-update.com&hops=2' \
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: you' -H 'X-Scope: team-a' | jq .
+
+# 4 — Dreaming-lite extraction (requires an LLM — any OpenAI-compatible /v1)
+task stop
+MEM_EXTRACT_ENABLED=true MEM_EXTRACT_BASE_URL=https://api.openai.com/v1 \
+  MEM_EXTRACT_MODEL=gpt-4o-mini MEM_EXTRACT_API_KEY=sk-... task run-extract
+# then in another shell, post prose and wait ~30s:
+curl -s -X POST localhost:8090/v1/observations \
+  -H 'Content-Type: application/json' \
+  -H 'X-Actor-Type: human' -H 'X-Actor-ID: analyst-x' -H 'X-Scope: team-hunt' \
+  -d '{"kind":"hunt_finding","content":"confirmed 198.51.100.23 resolved_to fallback-c2.phantom-infra.net during rotation"}'
+# check: curl enrich for fallback-c2.phantom-infra.net — fact proposed by extractor-v1 (auto-active because resolved_to is whitelisted)
+
+# 5 — Trust model (agent propose → human promote)
+#   open http://localhost:8090/swagger/index.html
+#   POST /v1/facts with X-Actor-Type: agent → status proposed
+#   POST /v1/facts/{id}/promote with X-Actor-Type: human → active + audited
+```
+
+Recall gate for the demo scenario:
+
+```bash
+task eval           # runs evals/demo.yaml — exits 1 on recall regression
+```
+
+## Testing (easy)
+
+```bash
+task test           # unit only — no DB, <5s
+task itest          # full suite vs live ClickHouse + Dgraph (-p 1, auto-starts stores)
+# or manually:
+MEM_TEST_CH_ADDR=localhost:9000 MEM_TEST_DGRAPH_ADDR=localhost:9080 go test -count=1 -p 1 ./...
+
+# single package / single test
+go test ./internal/memory -run TestEnrich -count=1 -v
+go test ./internal/api -run TestTimeline -count=1 -v
+
+# lint / build / swagger
+go vet ./...
+task build
+task swagger        # regenerate docs/swagger.{json,yaml} from handler annotations
+task seed           # seeds/smoke.jsonl into a running service
+task demo-seed      # full PHANTOM PORTAL dataset
+task mcp            # build local stdio MCP binary ./memmcp
+```
+
+Tests need no secrets. Integration tests skip unless the env vars are set (so `go test ./...` never fails on a laptop without Docker). All packages share one ClickHouse — each test isolates via a unique `X-Scope` and never `TRUNCATE`s. See [`docs/development.md`](docs/development.md#testing-conventions) for the invariants.
 
 ## Identity & scoping
 
